@@ -24,7 +24,7 @@ On a server, pull the published image — no source checkout needed, just the
 two files:
 
 ```bash
-mkdir -p ~/docker/omdb-proxy && cd ~/docker/omdb-proxy
+mkdir -p ~/docker/omdb-proxy/data && cd ~/docker/omdb-proxy
 
 curl -O https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/compose.prod.yaml
 curl -o .env https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/.env.example
@@ -33,15 +33,20 @@ curl -o .env https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/.env.
 docker compose -f compose.prod.yaml up -d
 ```
 
+Create `data/` yourself, as above, before the first `up`: Docker creates a
+missing bind-mount source as root, and the container runs as your own user.
+
 Upgrading later is `docker compose -f compose.prod.yaml pull` followed by the
 same `up -d`.
 
 The cache DB is bind-mounted to `./data/cache.db` next to the compose file, so
 it survives upgrades, `sqlite3 data/cache.db` works directly, and whatever
 backs up `~/docker` picks it up. Keeping it is the point: a fresh cache refills
-at `DAILY_BUDGET` requests per day. The container runs as root, so the files
-under `data/` are root-owned — `sudo` for direct reads, or go through
-`docker compose exec`.
+at `DAILY_BUDGET` requests per day.
+
+The container runs as `${PUID:-1000}:${PGID:-1000}` rather than root, so those
+files stay owned by you and need no `sudo` to read. If your account isn't
+`1000:1000`, set `PUID` and `PGID` in `.env` from `id -u` and `id -g`.
 
 From a source checkout, `compose.yaml` builds the image locally instead:
 

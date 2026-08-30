@@ -9,6 +9,12 @@ services:
   omdb-proxy:
     image: ghcr.io/lepinkainen/omdb-proxy:latest
     restart: unless-stopped
+    # Run as the host user that owns ./data, so the cache DB and its WAL
+    # sidecars are readable without sudo. Override PUID/PGID in .env if your
+    # account isn't 1000:1000 (`id -u`, `id -g`). The image has no /etc/passwd
+    # entry for this UID, which is fine: nothing in the proxy looks up a user
+    # name, and SQLite only needs write permission on /data.
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "8090:8090"
     env_file:
@@ -19,4 +25,8 @@ services:
       # sqlite3 and picked up by ordinary backups. Relative to this file, so
       # running from ~/docker/omdb-proxy/ puts the DB in
       # ~/docker/omdb-proxy/data/cache.db.
+      #
+      # Create this directory yourself before the first `up`. Docker will
+      # happily create a missing bind-mount source, but it creates it owned by
+      # root, and the non-root container above then can't write to it.
       - ./data:/data
