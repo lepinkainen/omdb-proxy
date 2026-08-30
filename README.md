@@ -172,6 +172,7 @@ OMDb only ever uses `/`, so these don't collide with anything a client might sen
 
 - `GET /healthz` — plain `ok`. Doesn't touch the database, so a slow or momentarily locked DB doesn't make the container look unhealthy.
 - `GET /stats` — JSON: quota used today, remaining budget, total cached rows, permanent vs. expiring row counts, and cache hit/miss/stale counters accumulated since the process started.
+- `GET /` with **no query string at all** — a human-readable HTML dashboard: quota remaining today, cache row counts (permanent/expiring/expired-but-retained, found/not-found), oldest and newest cache entries, the in-memory hit/miss/stale counters, and a table of the 25 most recently fetched entries. Any query carrying an actual parameter routes to the normal proxy path instead, so this can never shadow a real OMDb request (`/?` lands on the dashboard too — Go reports an empty query string for it — which is the same parameter-less request by another spelling); a bare `/` is a request OMDb itself only ever answers with an error, so no consumer depends on it. Like `/healthz` and `/stats`, it's ungated even when `PROXY_TOKEN` is set — the token is presented as `?apikey=...`, which would make the query non-empty and send the request straight back to the (still-gated) proxy path, making a gated index unreachable from a browser.
 
 ## Development
 

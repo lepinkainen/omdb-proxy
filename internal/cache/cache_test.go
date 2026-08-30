@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -283,7 +284,7 @@ func TestStatsCountsPermanentAndExpiringRows(t *testing.T) {
 		}
 	}
 
-	stats, err := store.Stats(ctx)
+	stats, err := store.Stats(ctx, time.Now())
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
@@ -295,5 +296,100 @@ func TestStatsCountsPermanentAndExpiringRows(t *testing.T) {
 	}
 	if stats.ExpiringRows != 1 {
 		t.Errorf("ExpiringRows = %d, want 1", stats.ExpiringRows)
+	}
+}
+
+func TestStatsEmptyCacheHasNilFetchTimes(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	stats, err := store.Stats(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.TotalRows != 0 {
+		t.Errorf("TotalRows = %d, want 0", stats.TotalRows)
+	}
+	if stats.OldestFetch != nil {
+		t.Errorf("OldestFetch = %v, want nil on an empty cache", stats.OldestFetch)
+	}
+	if stats.NewestFetch != nil {
+		t.Errorf("NewestFetch = %v, want nil on an empty cache", stats.NewestFetch)
+	}
+}
+
+func TestStatsCountsFoundNotFoundAndExpiredRows(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-24 * time.Hour)  // already expired as of now
+	future := now.Add(24 * time.Hour) // not yet expired as of now
+
+	rows := []Entry{
+		{CacheKey: "found-permanent", Query: "q1", Body: []byte("{}"), ContentType: "application/json", Status: 200, Found: true, FetchedAt: now.Add(-2 * time.Hour), ExpiresAt: nil},
+		{CacheKey: "found-expired", Query: "q2", Body: []byte("{}"), ContentType: "application/json", Status: 200, Found: true, FetchedAt: now.Add(-1 * time.Hour), ExpiresAt: &past},
+		{CacheKey: "notfound-live", Query: "q3", Body: []byte("{}"), ContentType: "application/json", Status: 200, Found: false, FetchedAt: now, ExpiresAt: &future},
+	}
+	for _, r := range rows {
+		if err := store.Put(ctx, r); err != nil {
+			t.Fatalf("Put(%s): %v", r.CacheKey, err)
+		}
+	}
+
+	stats, err := store.Stats(ctx, now)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.FoundRows != 2 {
+		t.Errorf("FoundRows = %d, want 2", stats.FoundRows)
+	}
+	if stats.NotFoundRows != 1 {
+		t.Errorf("NotFoundRows = %d, want 1", stats.NotFoundRows)
+	}
+	if stats.ExpiredRows != 1 {
+		t.Errorf("ExpiredRows = %d, want 1 (only the past-expiry row)", stats.ExpiredRows)
+	}
+	if stats.OldestFetch == nil || !stats.OldestFetch.Equal(now.Add(-2*time.Hour)) {
+		t.Errorf("OldestFetch = %v, want %v", stats.OldestFetch, now.Add(-2*time.Hour))
+	}
+	if stats.NewestFetch == nil || !stats.NewestFetch.Equal(now) {
+		t.Errorf("NewestFetch = %v, want %v", stats.NewestFetch, now)
+	}
+}
+
+func TestRecentOrdersNewestFirstAndRespectsLimit(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		e := Entry{
+			CacheKey:    fmt.Sprintf("key-%d", i),
+			Query:       fmt.Sprintf("i=tt%d", i),
+			Body:        []byte("{}"),
+			ContentType: "application/json",
+			Status:      200,
+			Found:       true,
+			FetchedAt:   base.Add(time.Duration(i) * time.Hour),
+		}
+		if err := store.Put(ctx, e); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	recent, err := store.Recent(ctx, 3)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(recent) != 3 {
+		t.Fatalf("len(Recent) = %d, want 3 (limit respected)", len(recent))
+	}
+
+	wantOrder := []string{"i=tt4", "i=tt3", "i=tt2"}
+	for i, want := range wantOrder {
+		if recent[i].Query != want {
+			t.Errorf("Recent[%d].Query = %q, want %q (newest first)", i, recent[i].Query, want)
+		}
 	}
 }

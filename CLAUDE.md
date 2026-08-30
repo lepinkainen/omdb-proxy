@@ -48,6 +48,8 @@ A store error on the *fast path* is deliberately non-fatal — it falls through 
 
 **Single SQLite connection is deliberate.** `Open` sets `db.SetMaxOpenConns(1)`. See the `internal/cache` package doc: it makes PRAGMA setup a one-time affair and makes `TryReserveQuota` race-free without an application-level lock, because `database/sql` serialises callers on the one connection. Raising the connection count silently breaks quota atomicity.
 
+**The index page (`internal/proxy/index.go`, `index.html`) is a third path out of `ServeHTTP`, gated on a completely empty `r.URL.RawQuery` at `/`.** It renders quota remaining, cache row counts, and the 25 most recent entries via `store.Stats` and `store.Recent`, using `html/template` so a hostile canonical query (already stripped of `apikey`) can't inject markup. No external assets — it has to render on a bare VPS with no internet.
+
 ## Invariants
 
 These are the expensive ones. Each corresponds to a test; if a test here looks wrong, suspect the change before the test.
@@ -63,6 +65,8 @@ These are the expensive ones. Each corresponds to a test; if a test here looks w
 **Serve stale rather than fail.** An expired entry plus a failing upstream, an exhausted budget, or an upstream quota error all return the stale body with `X-Cache: STALE`. A consumer should never break because the proxy ran out of quota. A true miss with nothing stale and a dead upstream is the only case that errors.
 
 **Quota detection matches `request limit` case-insensitively on a substring.** OMDb owns the exact wording. Pinning the literal string would silently stop detecting exhaustion and start caching it as a real miss.
+
+**A bare `GET /` (empty `RawQuery`) is the index page, never a proxy request — and that check has to run before the `PROXY_TOKEN` gate.** OMDb itself only ever answers a query-less `/` with an error, so no real consumer can depend on that exact request, which is what makes it a safe discriminator; any query carrying an actual parameter still goes through the normal proxy path untouched. (`/?` has an empty `RawQuery` too and also renders the index — the same parameter-less request by another spelling.) Putting the check after `authorised(r)` looks like the "more secure" order but is a trap: a client presents `PROXY_TOKEN` as `?apikey=...`, which makes the query non-empty, so a gated index would never be reachable by a browser in the first place — it's ungated on purpose, like `/healthz` and `/stats`.
 
 ## Cache key
 

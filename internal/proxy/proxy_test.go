@@ -610,3 +610,195 @@ func TestRequestLoggingNeverLeaksKeys(t *testing.T) {
 		t.Errorf("want the rejected request logged, got:\n%s", out)
 	}
 }
+
+// TestBareRootServesIndexWithoutTouchingUpstream is the test that catches
+// the index accidentally falling through into resolve: a bare GET / with
+// no query string must render the HTML dashboard entirely from the
+// cache/quota store, never by treating "" as a canonical query and
+// asking upstream about it.
+func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	h, _ := newTestHandler(t, upstream.URL, 900)
+
+	// Seed a cache entry so the recent-entries table has something
+	// recognisable to assert on.
+	doRequest(t, h, "i=tt0137523&apikey=client-key")
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("setup: upstream calls = %d, want 1", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want a text/html prefix", ct)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "900") {
+		t.Errorf("index body does not mention the daily budget (900):\n%s", body)
+	}
+	if !strings.Contains(body, "i=tt0137523") {
+		t.Errorf("index body does not mention the seeded cached query:\n%s", body)
+	}
+
+	// The critical assertion: rendering the index must not have made a
+	// second upstream call.
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (bare GET / must never reach upstream)", got)
+	}
+}
+
+// TestQueryStringRequestStillBehavesAsProxy locks in that the index
+// guard only fires on a completely empty raw query — any real proxy
+// request, even one that happens to target the same path, keeps the
+// existing MISS/upstream-call/byte-identical behaviour.
+func TestQueryStringRequestStillBehavesAsProxy(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	h, _ := newTestHandler(t, upstream.URL, 900)
+
+	resp := doRequest(t, h, "i=tt0137523&apikey=client-key")
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("upstream calls = %d, want 1", got)
+	}
+	if got := resp.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("X-Cache = %q, want MISS", got)
+	}
+	if resp.Body.String() != foundMovieJSON("1999") {
+		t.Errorf("body = %q, want the upstream body verbatim", resp.Body.String())
+	}
+}
+
+// TestIndexIsUngatedByProxyToken locks in the deliberate decision that
+// the index page is reachable even when PROXY_TOKEN is set — a gated
+// index would be unreachable from a plain browser, since the token is
+// presented as ?apikey=..., which makes the query non-empty and routes
+// back into the (still-gated) proxy path.
+func TestIndexIsUngatedByProxyToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	store, err := cache.Open(filepath.Join(t.TempDir(), "cache.db"))
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer store.Close()
+
+	h, err := proxy.New(store, proxy.Config{
+		UpstreamURL: upstream.URL,
+		APIKey:      proxyAPIKey,
+		DailyBudget: 900,
+		ProxyToken:  "secret-token",
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+
+	indexReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	indexRec := httptest.NewRecorder()
+	h.ServeHTTP(indexRec, indexReq)
+	if indexRec.Code != http.StatusOK {
+		t.Errorf("bare GET / with PROXY_TOKEN set: status = %d, want 200 (index is ungated)", indexRec.Code)
+	}
+	if ct := indexRec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("bare GET / Content-Type = %q, want a text/html prefix", ct)
+	}
+
+	// A real proxy request without the token must still be rejected.
+	rejected := doRequest(t, h, "i=tt0137523")
+	if rejected.Code != http.StatusUnauthorized {
+		t.Errorf("proxy request without token: status = %d, want 401", rejected.Code)
+	}
+}
+
+// TestIndexNeverLeaksAPIKeys guards the one thing the index page must
+// never do: display a key. It seeds a request that carried a client
+// apikey (which canonicalQuery strips before the query ever reaches the
+// cache) and asserts neither that client key nor the proxy's own
+// upstream key appears anywhere in the rendered HTML.
+func TestIndexNeverLeaksAPIKeys(t *testing.T) {
+	const clientKey = "clients-own-secret-key"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	h, _ := newTestHandler(t, upstream.URL, 900)
+	doRequest(t, h, "i=tt0137523&apikey="+clientKey)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if strings.Contains(body, clientKey) {
+		t.Errorf("index body contains the client's apikey %q:\n%s", clientKey, body)
+	}
+	if strings.Contains(body, proxyAPIKey) {
+		t.Errorf("index body contains the proxy's own upstream key %q:\n%s", proxyAPIKey, body)
+	}
+}
+
+// TestIndexGuardPathAndQueryEdges pins the two edges of the index guard's
+// condition, both of which are easy to get wrong when someone "tidies" it.
+//
+// "/?" is an empty RawQuery as far as net/url is concerned, so it renders
+// the index — correct, because it is the same parameter-less request by
+// another spelling. A non-root path, meanwhile, must never be diverted:
+// the mux hands every unmatched path to this handler, and OMDb-style
+// clients that build a base URL with a trailing path segment must keep
+// being proxied.
+func TestIndexGuardPathAndQueryEdges(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	h, _ := newTestHandler(t, upstream.URL, 900)
+
+	forcedQuery := httptest.NewRequest(http.MethodGet, "/?", nil)
+	forcedRec := httptest.NewRecorder()
+	h.ServeHTTP(forcedRec, forcedQuery)
+	if ct := forcedRec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf(`GET "/?" Content-Type = %q, want a text/html prefix (empty RawQuery is still the index)`, ct)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Errorf(`GET "/?" made %d upstream calls, want 0`, got)
+	}
+
+	nested := httptest.NewRequest(http.MethodGet, "/somepath?i=tt0137523", nil)
+	nestedRec := httptest.NewRecorder()
+	h.ServeHTTP(nestedRec, nested)
+	if got := nestedRec.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("non-root path X-Cache = %q, want MISS (must be proxied, not diverted to the index)", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("non-root path made %d upstream calls in total, want 1", got)
+	}
+}

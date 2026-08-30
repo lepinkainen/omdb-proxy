@@ -39,11 +39,28 @@ func (e *Entry) Expired(now time.Time) bool {
 	return e.ExpiresAt != nil && !now.Before(*e.ExpiresAt)
 }
 
-// Stats summarises the cache contents for the /stats admin endpoint.
+// Stats summarises the cache contents for the /stats admin endpoint and
+// the index page.
 type Stats struct {
 	TotalRows     int
 	PermanentRows int
 	ExpiringRows  int
+	FoundRows     int        // body said Response:"True"
+	NotFoundRows  int        // body said Response:"False"
+	ExpiredRows   int        // has an expires_at that is already in the past, as of the Stats call's now
+	OldestFetch   *time.Time // nil when the cache is empty
+	NewestFetch   *time.Time
+}
+
+// Summary is one row of the index page's recent-entries table. It
+// deliberately omits Body: the page never renders response bodies, and
+// selecting the blobs would make the query cost scale with cache size.
+type Summary struct {
+	Query     string
+	Status    int
+	Found     bool
+	FetchedAt time.Time
+	ExpiresAt *time.Time
 }
 
 // Store is the SQLite-backed cache and quota ledger.
@@ -257,21 +274,106 @@ func (s *Store) QuotaUsed(ctx context.Context, day string) (int, error) {
 	return used, nil
 }
 
-// Stats reports cache-wide counts for the /stats admin endpoint.
-func (s *Store) Stats(ctx context.Context) (Stats, error) {
+// Stats reports cache-wide counts for the /stats admin endpoint and the
+// index page. now is needed only to classify ExpiredRows; every other
+// field is derived from the stored rows alone.
+func (s *Store) Stats(ctx context.Context, now time.Time) (Stats, error) {
+	// expires_at is compared lexicographically against now formatted the
+	// same way Put writes it (now.UTC().Format(time.RFC3339)). That
+	// format is fixed-width and always Z-suffixed (UTC), so string order
+	// equals time order — this silently breaks if anything ever writes a
+	// non-UTC or offset timestamp into expires_at. The comparison is <=,
+	// not <, to match Entry.Expired's !now.Before(expires_at): an entry
+	// expiring exactly now is already stale, and the two must not
+	// disagree about it.
+	nowStr := now.UTC().Format(time.RFC3339)
+
 	row := s.db.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
-			SUM(CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END)
+			SUM(CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END),
+			SUM(CASE WHEN found != 0 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN found = 0 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END),
+			MIN(fetched_at),
+			MAX(fetched_at)
 		FROM responses
-	`)
+	`, nowStr)
 
 	var stats Stats
-	var permanent sql.NullInt64
-	if err := row.Scan(&stats.TotalRows, &permanent); err != nil {
+	var permanent, found, notFound, expired sql.NullInt64
+	var oldest, newest sql.NullString
+	if err := row.Scan(&stats.TotalRows, &permanent, &found, &notFound, &expired, &oldest, &newest); err != nil {
 		return Stats{}, errors.Wrap(err, "read cache stats")
 	}
 	stats.PermanentRows = int(permanent.Int64)
 	stats.ExpiringRows = stats.TotalRows - stats.PermanentRows
+	stats.FoundRows = int(found.Int64)
+	stats.NotFoundRows = int(notFound.Int64)
+	stats.ExpiredRows = int(expired.Int64)
+
+	if oldest.Valid {
+		t, err := time.Parse(time.RFC3339, oldest.String)
+		if err != nil {
+			return Stats{}, errors.Wrap(err, "parse oldest fetched_at")
+		}
+		stats.OldestFetch = &t
+	}
+	if newest.Valid {
+		t, err := time.Parse(time.RFC3339, newest.String)
+		if err != nil {
+			return Stats{}, errors.Wrap(err, "parse newest fetched_at")
+		}
+		stats.NewestFetch = &t
+	}
+
 	return stats, nil
+}
+
+// Recent lists the most recently fetched entries, newest first, for the
+// index page's recent-entries table.
+func (s *Store) Recent(ctx context.Context, limit int) ([]Summary, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT query, status, found, fetched_at, expires_at
+		FROM responses
+		ORDER BY fetched_at DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, errors.Wrap(err, "query recent entries")
+	}
+	defer rows.Close()
+
+	var out []Summary
+	for rows.Next() {
+		var sum Summary
+		var fetchedAt string
+		var expiresAt sql.NullString
+		var found int
+		if err := rows.Scan(&sum.Query, &sum.Status, &found, &fetchedAt, &expiresAt); err != nil {
+			return nil, errors.Wrap(err, "scan recent entry")
+		}
+		sum.Found = found != 0
+
+		t, err := time.Parse(time.RFC3339, fetchedAt)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse fetched_at")
+		}
+		sum.FetchedAt = t
+
+		if expiresAt.Valid {
+			et, err := time.Parse(time.RFC3339, expiresAt.String)
+			if err != nil {
+				return nil, errors.Wrap(err, "parse expires_at")
+			}
+			sum.ExpiresAt = &et
+		}
+
+		out = append(out, sum)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrap(err, "iterate recent entries")
+	}
+
+	return out, nil
 }

@@ -157,6 +157,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// always be zero.
 	start := time.Now()
 
+	// GET / with a completely empty raw query is the human-readable
+	// index page, not a proxy request. This discriminator is safe
+	// because OMDb itself only ever answers a bare "/" with an error
+	// body ("no parameters provided") — no real consumer can be relying
+	// on that response, so diverting it here can never shadow a request
+	// a client actually wants answered. Any query carrying an actual
+	// parameter keeps the existing behaviour byte-for-byte. ("/?" also
+	// lands here — net/url reports an empty RawQuery for it — which is
+	// fine: it is the same parameter-less request by another spelling.)
+	//
+	// This has to sit before the PROXY_TOKEN gate below, not after: a
+	// gated client presents the token as ?apikey=..., which makes the
+	// query non-empty and routes straight back into the proxy path — so
+	// if the index lived behind authorised(), a browser could never
+	// reach it. The index is therefore deliberately ungated, exactly
+	// like the existing /healthz and /stats endpoints.
+	if r.Method == http.MethodGet && r.URL.Path == "/" && r.URL.RawQuery == "" {
+		h.serveIndex(w, r, start)
+		return
+	}
+
 	if !h.authorised(r) {
 		h.logger.Warn("request rejected", "reason", "bad proxy token", "remote_addr", r.RemoteAddr)
 		writeBody(w, http.StatusUnauthorized, quotaContentType, []byte(invalidKeyBody), "")
@@ -461,7 +482,7 @@ func (h *Handler) StatsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheStats, err := h.store.Stats(ctx)
+	cacheStats, err := h.store.Stats(ctx, h.now())
 	if err != nil {
 		http.Error(w, "omdb-proxy: failed to read cache stats", http.StatusInternalServerError)
 		return
