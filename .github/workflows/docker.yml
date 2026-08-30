@@ -22,8 +22,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Pull requests build the image to prove the Dockerfile still works,
-      # but must not publish: a fork PR has no write access to the registry.
+      # PRs build but never publish: a fork's token can't write the registry.
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -46,9 +45,6 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          # linux/arm64 costs nothing to produce: the Go build stage runs on
-          # the native runner and cross-compiles, so no QEMU emulation is
-          # involved. See the Dockerfile's BUILDPLATFORM comment.
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

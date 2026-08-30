@@ -93,6 +93,12 @@ Tests must be hermetic — nothing may contact `omdbapi.com`. Use `httptest` ser
 
 Quota, breaker, and singleflight tests assert exact upstream call counts via an `atomic.Int32` in the fake handler. When a change alters how many upstream calls a scenario makes, that count is the assertion that will catch it.
 
+## Background documents
+
+`ai-docs/` holds LLM-facing background that would bloat the files it describes. Keep it that way: config files stay terse and point here, rather than carrying paragraphs of rationale in comments.
+
+- `ai-docs/deployment.md` — image build, GHCR workflows, compose files, volume and user choices.
+
 ## Conventions
 
 - Errors wrap with `github.com/cockroachdb/errors`; sentinels are checked with `errors.Is`.
@@ -104,7 +110,7 @@ Quota, breaker, and singleflight tests assert exact upstream call counts via an 
 
 Multi-stage, `CGO_ENABLED=0` (the driver is pure-Go `modernc.org/sqlite`), final stage `gcr.io/distroless/static-debian12`. A separate `alpine` stage exists solely to supply `ca-certificates.crt`: `golang:alpine` does not install it and `distroless/static` ships none, so without that copy every upstream fetch dies at the TLS handshake with `x509: certificate signed by unknown authority`. The cache lives on the `/data` volume; losing it means refilling at `DAILY_BUDGET` per day.
 
-`.github/workflows/docker.yml` publishes the image to `ghcr.io/lepinkainen/omdb-proxy` for `linux/amd64` and `linux/arm64` on every push to `main` and every `v*` tag. The build stage is pinned to `--platform=$BUILDPLATFORM` and takes `GOARCH` from `$TARGETARCH`, so both architectures cross-compile on the native runner — dropping that pin reintroduces QEMU emulation and turns a fast build into a slow one. `compose.prod.yaml` consumes the published image and is the file the VPS runs; `compose.yaml` builds locally. Production bind-mounts `./data:/data` rather than using a named volume, because the cache DB is the valuable artefact and wants to be inspectable with `sqlite3` and reachable by ordinary host backups.
+CI publishes multi-arch images to `ghcr.io/lepinkainen/omdb-proxy`; `compose.prod.yaml` runs one on the VPS, `compose.yaml` builds locally. `ai-docs/deployment.md` carries the reasoning behind the cross-compile pin, the bind mount, and the non-root user — read it before changing any of those.
 
 ## Consumers
 

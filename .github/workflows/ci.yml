@@ -32,6 +32,5 @@ jobs:
 
       - run: go build ./...
 
-      # -race matters here: the singleflight and quota-reservation tests are
-      # the ones that would catch a regression in cache-fill deduplication.
+      # -race: the singleflight and quota-reservation tests need it.
       - run: go test ./... -race

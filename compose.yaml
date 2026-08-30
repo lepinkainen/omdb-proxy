@@ -1,7 +1,6 @@
 services:
   omdb-proxy:
-    # Builds from this checkout. To run the published image instead, use
-    # compose.prod.yaml, which needs no source tree.
+    # Builds from this checkout; compose.prod.yaml runs the published image.
     build: .
     restart: unless-stopped
     ports:

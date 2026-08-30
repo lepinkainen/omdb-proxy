@@ -1,10 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- build ---------------------------------------------------------------
-# --platform=$BUILDPLATFORM pins this stage to the machine doing the building
-# rather than the target architecture. Go cross-compiles natively, so the
-# arm64 image is produced by an amd64 runner at full speed with no QEMU
-# emulation in the loop.
+# Pinned to the build host: Go cross-compiles, so arm64 needs no QEMU.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 WORKDIR /src
@@ -14,14 +11,14 @@ RUN go mod download
 
 COPY . .
 
-# TARGETOS/TARGETARCH are supplied by buildx for each requested platform;
-# they default to the build host's own values for a plain `docker build`.
+# Supplied by buildx per target platform; the defaults cover plain
+# `docker build`.
 ARG TARGETOS=linux
 ARG TARGETARCH
 
 # CGO_ENABLED=0 is required: modernc.org/sqlite is pure Go, and the final
 # image has no C toolchain to link against anyway. It is also what makes the
-# cross-compile above a plain environment-variable change.
+# cross-compile a plain environment-variable change.
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -o /out/omdb-proxy ./cmd/omdb-proxy
 

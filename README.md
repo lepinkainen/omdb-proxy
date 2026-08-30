@@ -33,20 +33,16 @@ curl -o .env https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/.env.
 docker compose -f compose.prod.yaml up -d
 ```
 
-Create `data/` yourself, as above, before the first `up`: Docker creates a
-missing bind-mount source as root, and the container runs as your own user.
+Create `data/` yourself, as above: Docker would create a missing bind-mount
+source owned by root, which the non-root container can't write to.
 
-Upgrading later is `docker compose -f compose.prod.yaml pull` followed by the
-same `up -d`.
+Upgrading is `docker compose -f compose.prod.yaml pull` then `up -d`.
 
-The cache DB is bind-mounted to `./data/cache.db` next to the compose file, so
-it survives upgrades, `sqlite3 data/cache.db` works directly, and whatever
-backs up `~/docker` picks it up. Keeping it is the point: a fresh cache refills
-at `DAILY_BUDGET` requests per day.
-
-The container runs as `${PUID:-1000}:${PGID:-1000}` rather than root, so those
-files stay owned by you and need no `sudo` to read. If your account isn't
-`1000:1000`, set `PUID` and `PGID` in `.env` from `id -u` and `id -g`.
+The cache DB is bind-mounted at `./data/cache.db`, so it survives upgrades and
+`sqlite3 data/cache.db` works directly — worth keeping, since a fresh cache
+refills at `DAILY_BUDGET` requests per day. The container runs as
+`${PUID:-1000}:${PGID:-1000}`, so those files stay owned by you; set `PUID`
+and `PGID` in `.env` if your account isn't `1000:1000`.
 
 From a source checkout, `compose.yaml` builds the image locally instead:
 
@@ -173,12 +169,7 @@ Tests are hermetic — nothing talks to the real `omdbapi.com`. Fake upstreams a
 
 ### CI and published images
 
-Two GitHub Actions workflows back the repo:
-
-- `.github/workflows/ci.yml` runs `gofmt`, `go vet`, `go build`, and `go test -race` on every push and pull request.
-- `.github/workflows/docker.yml` builds the image for `linux/amd64` and `linux/arm64` and pushes it to the GitHub Container Registry.
-
-Published tags on `ghcr.io/lepinkainen/omdb-proxy`:
+`ci.yml` runs `gofmt`, `go vet`, `go build`, and `go test -race` on every push and pull request. `docker.yml` builds for `linux/amd64` and `linux/arm64` and pushes to the GitHub Container Registry. Published tags on `ghcr.io/lepinkainen/omdb-proxy`:
 
 | Tag | Points at |
 | --- | --- |
@@ -187,18 +178,14 @@ Published tags on `ghcr.io/lepinkainen/omdb-proxy`:
 | `sha-<full-sha>` | one exact commit, for pinning or rolling back |
 | `1.2.3`, `1.2` | a pushed `v1.2.3` git tag |
 
-Pull requests build the image but don't push it — a fork's token has no write
-access to the registry.
-
-The package inherits the repository's visibility on its first publish. If the
-repo is private and the VPS should still be able to `docker pull`, either make
-the package public from its GitHub page, or log the VPS in with a personal
-access token that has `read:packages`:
+Pull requests build the image but don't push it. The package inherits the
+repository's visibility on first publish; if the repo goes private, either make
+the package public or log the VPS in with a `read:packages` token:
 
 ```bash
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u lepinkainen --password-stdin
 ```
 
-The Dockerfile cross-compiles rather than emulating: the Go build stage is
-pinned to `$BUILDPLATFORM` and passed `GOARCH=$TARGETARCH`, so the arm64 image
-is produced at native speed on an amd64 runner.
+`ai-docs/deployment.md` covers the rest: why the build cross-compiles rather
+than emulating, why production bind-mounts instead of using a named volume, and
+why the container runs non-root.

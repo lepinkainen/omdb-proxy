@@ -1,32 +1,13 @@
-# Deployment compose file for the VPS: pulls the published image instead of
-# building it. `docker compose -f compose.prod.yaml pull && ... up -d` is the
-# whole upgrade procedure.
-#
-# The plain compose.yaml next to this one builds from source and is for local
-# work; nothing here depends on the source tree, so this file plus a .env is
-# all the VPS needs.
+# Runs the published image. See ai-docs/deployment.md for the reasoning.
+# `mkdir -p data` before the first `up` — Docker would create it as root.
 services:
   omdb-proxy:
     image: ghcr.io/lepinkainen/omdb-proxy:latest
     restart: unless-stopped
-    # Run as the host user that owns ./data, so the cache DB and its WAL
-    # sidecars are readable without sudo. Override PUID/PGID in .env if your
-    # account isn't 1000:1000 (`id -u`, `id -g`). The image has no /etc/passwd
-    # entry for this UID, which is fine: nothing in the proxy looks up a user
-    # name, and SQLite only needs write permission on /data.
     user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "8090:8090"
     env_file:
       - .env
     volumes:
-      # Bind mount rather than a named volume: the cache DB is the valuable
-      # part of this deployment, and a path on the host can be inspected with
-      # sqlite3 and picked up by ordinary backups. Relative to this file, so
-      # running from ~/docker/omdb-proxy/ puts the DB in
-      # ~/docker/omdb-proxy/data/cache.db.
-      #
-      # Create this directory yourself before the first `up`. Docker will
-      # happily create a missing bind-mount source, but it creates it owned by
-      # root, and the non-root container above then can't write to it.
       - ./data:/data
