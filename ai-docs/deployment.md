@@ -65,11 +65,22 @@ deduplication and quota-reservation tests are the ones that would catch a
 regression in cache-fill behaviour, and they only fail reliably under it.
 
 `docker.yml` builds `linux/amd64` and `linux/arm64` and pushes to GHCR on
-`main` and on `v*` tags; the README lists the published tags.
+`main` and on `v*` tags. Published tags on `ghcr.io/lepinkainen/omdb-proxy`:
+
+| Tag | Points at |
+| --- | --- |
+| `latest` | the most recent build of `main` |
+| `main` | the same thing, named by branch |
+| `sha-<full-sha>` | one exact commit, for pinning or rolling back |
+| `1.2.3`, `1.2` | a pushed `v1.2.3` git tag |
 
 Pull requests build without pushing, because a fork's `GITHUB_TOKEN` has no
 write access to the registry — the build still proves the Dockerfile works.
 
 The package inherits repository visibility on first publish. If the repo goes
 private, either make the package public from its GitHub page or log the VPS in
-with a PAT carrying `read:packages`.
+with a PAT carrying `read:packages`:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u lepinkainen --password-stdin
+```

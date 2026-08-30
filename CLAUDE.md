@@ -102,6 +102,7 @@ Quota, breaker, and singleflight tests assert exact upstream call counts via an 
 `ai-docs/` holds LLM-facing background that would bloat the files it describes. Keep it that way: config files stay terse and point here, rather than carrying paragraphs of rationale in comments.
 
 - `ai-docs/deployment.md` — image build, GHCR workflows, compose files, volume and user choices.
+- `ai-docs/caching.md` — wire compatibility, caching policy and its traps, the cache key, and the SQLite schema.
 
 ## Conventions
 
