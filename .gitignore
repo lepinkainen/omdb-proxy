@@ -1,0 +1,8 @@
+.env
+
+# The built binary at the repo root (e.g. `go build -o omdb-proxy ./cmd/omdb-proxy`).
+# Rooted so it doesn't also match cmd/omdb-proxy/, the source package.
+/omdb-proxy
+
+*.db
+*.db-*

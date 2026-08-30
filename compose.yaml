@@ -1,0 +1,15 @@
+services:
+  omdb-proxy:
+    build: .
+    # Or, once an image is published somewhere:
+    # image: ghcr.io/lepinkainen/omdb-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    env_file:
+      - .env
+    volumes:
+      - omdb-proxy-data:/data
+
+volumes:
+  omdb-proxy-data:
