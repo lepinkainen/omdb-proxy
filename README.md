@@ -24,6 +24,8 @@ On a server, pull the published image — no source checkout needed, just the
 two files:
 
 ```bash
+mkdir -p ~/docker/omdb-proxy && cd ~/docker/omdb-proxy
+
 curl -O https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/compose.prod.yaml
 curl -o .env https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/.env.example
 # edit .env, set OMDB_API_KEY
@@ -32,9 +34,14 @@ docker compose -f compose.prod.yaml up -d
 ```
 
 Upgrading later is `docker compose -f compose.prod.yaml pull` followed by the
-same `up -d`. The cache lives in the `omdb-proxy-data` named volume and
-survives, which matters: a fresh volume refills at `DAILY_BUDGET` requests per
-day.
+same `up -d`.
+
+The cache DB is bind-mounted to `./data/cache.db` next to the compose file, so
+it survives upgrades, `sqlite3 data/cache.db` works directly, and whatever
+backs up `~/docker` picks it up. Keeping it is the point: a fresh cache refills
+at `DAILY_BUDGET` requests per day. The container runs as root, so the files
+under `data/` are root-owned — `sudo` for direct reads, or go through
+`docker compose exec`.
 
 From a source checkout, `compose.yaml` builds the image locally instead:
 

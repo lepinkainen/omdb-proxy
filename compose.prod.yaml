@@ -14,9 +14,9 @@ services:
     env_file:
       - .env
     volumes:
-      - omdb-proxy-data:/data
-
-volumes:
-  # Named volume, not a bind mount: losing the cache DB means refilling it at
-  # DAILY_BUDGET requests per day.
-  omdb-proxy-data:
+      # Bind mount rather than a named volume: the cache DB is the valuable
+      # part of this deployment, and a path on the host can be inspected with
+      # sqlite3 and picked up by ordinary backups. Relative to this file, so
+      # running from ~/docker/omdb-proxy/ puts the DB in
+      # ~/docker/omdb-proxy/data/cache.db.
+      - ./data:/data

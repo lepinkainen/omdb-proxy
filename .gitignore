@@ -6,3 +6,7 @@
 
 *.db
 *.db-*
+
+# The bind-mounted cache directory, if compose.prod.yaml is ever run from a
+# checkout rather than from ~/docker/omdb-proxy/.
+/data/
