@@ -25,7 +25,11 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	if err := run(logger); err != nil {
-		logger.Error("omdb-proxy exited", "error", err)
+		// err.Error() keeps this to the wrap chain ("open cache
+		// database: enable WAL mode: unable to open database file"),
+		// which is the diagnostic part. Logging err itself makes slog
+		// print the cockroachdb stack trace as one 20-line value.
+		logger.Error("omdb-proxy exited", "error", err.Error())
 		os.Exit(1)
 	}
 }
@@ -48,6 +52,7 @@ func run(logger *slog.Logger) error {
 		DailyBudget: cfg.dailyBudget,
 		ProxyToken:  cfg.proxyToken,
 		NotFoundTTL: cfg.notFoundTTL,
+		Logger:      logger,
 	})
 	if err != nil {
 		return errors.Wrap(err, "construct proxy handler")

@@ -102,7 +102,7 @@ Quota, breaker, and singleflight tests assert exact upstream call counts via an 
 ## Conventions
 
 - Errors wrap with `github.com/cockroachdb/errors`; sentinels are checked with `errors.Is`.
-- The API key is never logged, never included in an error message, never echoed in a response.
+- The API key is never logged, never included in an error message, never echoed in a response. This is why the per-request log line in `ServeHTTP` logs the *canonical* query and never `r.URL.RawQuery`: the raw query holds the client's own key, and the proxy token itself when `PROXY_TOKEN` is set. `TestRequestLoggingNeverLeaksKeys` guards it.
 - Doc comments on exported symbols, and comments explain *why*. The invariants above are only defensible with their reasoning attached — several are one plausible-looking simplification away from costing 900 requests a day.
 - `/stats` counters (hit/miss/stale) live in memory and reset on restart, which is the intuitive reading of "since process start". Quota and cache contents live in SQLite and do not.
 

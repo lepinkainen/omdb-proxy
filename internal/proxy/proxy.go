@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -59,6 +60,10 @@ type Config struct {
 	// Defaults to DefaultNotFoundTTL (see its doc comment for why this
 	// is finite rather than permanent) when zero.
 	NotFoundTTL time.Duration
+	// Logger receives one line per request plus any error the handler
+	// recovers from internally. Defaults to a discard logger when nil,
+	// which is what keeps tests quiet.
+	Logger *slog.Logger
 }
 
 // Stats is the in-memory, process-lifetime counters reported by
@@ -82,6 +87,7 @@ type Handler struct {
 	httpClient  *http.Client
 	now         func() time.Time
 	notFoundTTL time.Duration
+	logger      *slog.Logger
 
 	group singleflight.Group
 
@@ -109,6 +115,10 @@ func New(store *cache.Store, cfg Config) (*Handler, error) {
 	if notFoundTTL == 0 {
 		notFoundTTL = DefaultNotFoundTTL
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 
 	return &Handler{
 		store:       store,
@@ -119,6 +129,7 @@ func New(store *cache.Store, cfg Config) (*Handler, error) {
 		httpClient:  httpClient,
 		now:         now,
 		notFoundTTL: notFoundTTL,
+		logger:      logger,
 	}, nil
 }
 
@@ -133,8 +144,21 @@ func (h *Handler) Stats() Stats {
 }
 
 // ServeHTTP implements the OMDb-compatible endpoint at "/".
+//
+// Every request produces exactly one log line, so an operator can see
+// what consumers are asking for and which queries are costing upstream
+// calls. It logs the *canonical* query rather than the raw one: the raw
+// query carries whatever apikey the client sent, which is the client's
+// own OMDb key or — when PROXY_TOKEN is set — the proxy token itself.
+// canonicalQuery has already dropped it.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Wall clock, not h.now: the pinned test clock exists to make expiry
+	// decisions deterministic, and a latency measured against it would
+	// always be zero.
+	start := time.Now()
+
 	if !h.authorised(r) {
+		h.logger.Warn("request rejected", "reason", "bad proxy token", "remote_addr", r.RemoteAddr)
 		writeBody(w, http.StatusUnauthorized, quotaContentType, []byte(invalidKeyBody), "")
 		return
 	}
@@ -148,6 +172,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if entry, err := h.store.Get(ctx, cacheKey); err == nil && entry != nil && !entry.Expired(h.now()) {
 		h.hits.Add(1)
+		h.logRequest(canonical, "HIT", entry.Status, start)
 		writeEntry(w, entry, "HIT")
 		return
 	}
@@ -159,6 +184,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return h.resolve(ctx, cacheKey, canonical, isSearch)
 	})
 	if err != nil {
+		// err.Error(), not err: slog formats values with %+v, which for
+		// a cockroachdb error means the whole stack trace on one line.
+		h.logger.Error("request failed", "query", canonical, "error", err.Error())
 		http.Error(w, "omdb-proxy: internal error", http.StatusInternalServerError)
 		return
 	}
@@ -172,7 +200,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		h.misses.Add(1)
 	}
+	h.logRequest(canonical, res.cacheStatus, res.status, start)
 	writeBody(w, res.status, res.contentType, res.body, res.cacheStatus)
+}
+
+// logRequest emits the one-per-request line. cache is the same value
+// the response carries in X-Cache, which makes "did this cost me an
+// upstream call?" readable straight from the log: MISS did, HIT and
+// STALE did not.
+func (h *Handler) logRequest(canonical, cache string, status int, start time.Time) {
+	h.logger.Info("request",
+		"query", canonical,
+		"cache", cache,
+		"status", status,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
 }
 
 // resolution is what a single (possibly single-flighted) cache
@@ -236,11 +278,12 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 		// a perfectly good STALE response and will never see this
 		// quota error itself, so this is the only place left that can
 		// record it. A failure to persist the marker doesn't change
-		// the response we're about to serve, and this handler has no
-		// logger to report it to, so we deliberately swallow it —
-		// worst case, some other request records the exhaustion for
-		// us before the day is out.
-		_ = h.store.MarkExhausted(ctx, day, h.budget)
+		// the response we're about to serve, so it is logged rather
+		// than returned — worst case, some other request records the
+		// exhaustion for us before the day is out.
+		if err := h.store.MarkExhausted(ctx, day, h.budget); err != nil {
+			h.logger.Error("record upstream quota exhaustion", "error", err.Error())
+		}
 
 		return h.staleOrQuota(entry, body, contentType, status)
 	}
@@ -258,7 +301,10 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 	})
 	if putErr != nil {
 		// We already have a good response to hand back; a failure to
-		// persist it just means we'll pay for it again next time.
+		// persist it just means we'll pay for it again next time. Worth
+		// a log line, though: a persistently unwritable cache burns the
+		// daily budget on requests that should have been free.
+		h.logger.Error("store cache entry", "query", canonical, "error", putErr.Error())
 		return resolution{body: body, contentType: contentType, status: status, cacheStatus: "MISS"}, nil
 	}
 
@@ -314,16 +360,31 @@ func (h *Handler) fetchUpstream(ctx context.Context, canonical string) (body []b
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		return nil, "", 0, errors.Wrap(err, "upstream request failed")
+		return nil, "", 0, errors.Wrap(withoutURL(err), "upstream request failed")
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", 0, errors.Wrap(err, "read upstream body")
+		return nil, "", 0, errors.Wrap(withoutURL(err), "read upstream body")
 	}
 
 	return data, resp.Header.Get("Content-Type"), resp.StatusCode, nil
+}
+
+// withoutURL unwraps a *url.Error to its underlying cause, discarding
+// the URL it carries. That URL is the outgoing upstream request, which
+// has the proxy's own apikey set on it — and net/http puts the whole
+// thing in the error text, so anything that logs such an error verbatim
+// publishes the key. The cause ("dial tcp ...: connection refused") is
+// the useful half anyway, and the query is logged separately in its
+// canonical, key-free form.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
 
 // authorised checks the optional PROXY_TOKEN gate. With no token

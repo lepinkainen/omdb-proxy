@@ -77,6 +77,22 @@ client := omdb.NewClient(
 
 That's the whole migration. The client still sends an `apikey` query parameter (OMDb's protocol requires one), but the proxy discards it and substitutes its own upstream key — unless `PROXY_TOKEN` is configured, in which case the client's `apikey` (or an `Authorization: Bearer` header) has to match that token instead. See [Configuration](#configuration) below.
 
+## Logs
+
+One `slog` line per request on stderr, plus startup and shutdown:
+
+```
+level=INFO msg=request query="i=tt0137523" cache=MISS status=200 duration_ms=214
+level=INFO msg=request query="i=tt0137523" cache=HIT status=200 duration_ms=0
+```
+
+`cache` mirrors the `X-Cache` header, so `cache=MISS` marks the requests that
+actually spent upstream quota. The query is the canonical one, with `apikey`
+stripped — no client key or proxy token ever reaches the log. Rejected tokens
+log at WARN, and cache-write or quota-marker failures at ERROR.
+
+`docker compose -f compose.prod.yaml logs -f` on the VPS.
+
 ## Caching policy
 
 Expiry is derived from the release year in the response body wherever there is one, and is deliberately skewed towards "cache forever" — the whole point of this proxy is to stop re-fetching movies whose metadata essentially never changes.

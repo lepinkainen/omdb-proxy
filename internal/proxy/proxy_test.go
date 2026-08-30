@@ -1,12 +1,15 @@
 package proxy_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -520,4 +523,90 @@ func TestHealthzAndStats(t *testing.T) {
 func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// TestRequestLoggingNeverLeaksKeys is the guard on the one thing a
+// request log must never do here. The raw query carries the client's own
+// apikey, and when PROXY_TOKEN is set it carries the proxy token itself,
+// so the handler logs the canonical query — which has dropped it — and
+// never r.URL.RawQuery.
+func TestRequestLoggingNeverLeaksKeys(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	store, err := cache.Open(filepath.Join(t.TempDir(), "cache.db"))
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer store.Close()
+
+	var logs bytes.Buffer
+	h, err := proxy.New(store, proxy.Config{
+		UpstreamURL: upstream.URL,
+		APIKey:      proxyAPIKey,
+		DailyBudget: 900,
+		ProxyToken:  "secret-token",
+		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+
+	doRequest(t, h, "i=tt0137523&apikey=secret-token")
+	doRequest(t, h, "i=tt0137523&apikey=secret-token")
+	doRequest(t, h, "i=tt0137523&apikey=wrong-token")
+
+	// A dead upstream is the path that produces an error log line, and
+	// net/http's *url.Error carries the outgoing URL — with the proxy's
+	// apikey on it — in its message.
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	dead.Close()
+
+	deadStore, err := cache.Open(filepath.Join(t.TempDir(), "dead.db"))
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer deadStore.Close()
+
+	deadHandler, err := proxy.New(deadStore, proxy.Config{
+		UpstreamURL: dead.URL,
+		APIKey:      proxyAPIKey,
+		DailyBudget: 900,
+		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	doRequest(t, deadHandler, "i=tt0137523")
+
+	out := logs.String()
+	if !strings.Contains(out, "request failed") {
+		t.Errorf("want the failed upstream request logged, got:\n%s", out)
+	}
+	// A stack trace here would mean the error was logged as a value
+	// rather than a string, which is also what would drag the URL along.
+	if strings.Contains(out, "stack trace") {
+		t.Errorf("log output contains a stack trace:\n%s", out)
+	}
+	for _, secret := range []string{"secret-token", "wrong-token", proxyAPIKey} {
+		if strings.Contains(out, secret) {
+			t.Errorf("log output contains %q:\n%s", secret, out)
+		}
+	}
+
+	if got := strings.Count(out, `msg=request `); got != 2 {
+		t.Errorf("request log lines = %d, want 2\n%s", got, out)
+	}
+	if !strings.Contains(out, "cache=MISS") || !strings.Contains(out, "cache=HIT") {
+		t.Errorf("want one MISS and one HIT logged, got:\n%s", out)
+	}
+	if !strings.Contains(out, `query="i=tt0137523"`) {
+		t.Errorf("want the canonical query logged, got:\n%s", out)
+	}
+	if !strings.Contains(out, "request rejected") {
+		t.Errorf("want the rejected request logged, got:\n%s", out)
+	}
 }
