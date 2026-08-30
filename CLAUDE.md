@@ -104,6 +104,8 @@ Quota, breaker, and singleflight tests assert exact upstream call counts via an 
 
 Multi-stage, `CGO_ENABLED=0` (the driver is pure-Go `modernc.org/sqlite`), final stage `gcr.io/distroless/static-debian12`. A separate `alpine` stage exists solely to supply `ca-certificates.crt`: `golang:alpine` does not install it and `distroless/static` ships none, so without that copy every upstream fetch dies at the TLS handshake with `x509: certificate signed by unknown authority`. The cache lives on the `/data` volume; losing it means refilling at `DAILY_BUDGET` per day.
 
+`.github/workflows/docker.yml` publishes the image to `ghcr.io/lepinkainen/omdb-proxy` for `linux/amd64` and `linux/arm64` on every push to `main` and every `v*` tag. The build stage is pinned to `--platform=$BUILDPLATFORM` and takes `GOARCH` from `$TARGETARCH`, so both architectures cross-compile on the native runner — dropping that pin reintroduces QEMU emulation and turns a fast build into a slow one. `compose.prod.yaml` consumes the published image and is the file the VPS runs; `compose.yaml` builds locally.
+
 ## Consumers
 
 Any project that already builds its OMDb URL from a configurable base can point at this proxy unchanged. For the `moviepicker` repo specifically, `internal/omdb` already has a `WithBaseURL` option — it is currently test-only, so wiring it to an environment variable is the whole integration.

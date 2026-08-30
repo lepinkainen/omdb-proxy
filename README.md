@@ -20,6 +20,24 @@ One addition: every response carries an `X-Cache: HIT | MISS | STALE` header, pu
 
 ## Running it
 
+On a server, pull the published image — no source checkout needed, just the
+two files:
+
+```bash
+curl -O https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/compose.prod.yaml
+curl -o .env https://raw.githubusercontent.com/lepinkainen/omdb-proxy/main/.env.example
+# edit .env, set OMDB_API_KEY
+
+docker compose -f compose.prod.yaml up -d
+```
+
+Upgrading later is `docker compose -f compose.prod.yaml pull` followed by the
+same `up -d`. The cache lives in the `omdb-proxy-data` named volume and
+survives, which matters: a fresh volume refills at `DAILY_BUDGET` requests per
+day.
+
+From a source checkout, `compose.yaml` builds the image locally instead:
+
 ```bash
 cp .env.example .env
 # edit .env, set OMDB_API_KEY
@@ -140,3 +158,35 @@ go test ./...
 ```
 
 Tests are hermetic — nothing talks to the real `omdbapi.com`. Fake upstreams are `httptest.Server` instances, and the cache uses temp-file SQLite databases created per test.
+
+### CI and published images
+
+Two GitHub Actions workflows back the repo:
+
+- `.github/workflows/ci.yml` runs `gofmt`, `go vet`, `go build`, and `go test -race` on every push and pull request.
+- `.github/workflows/docker.yml` builds the image for `linux/amd64` and `linux/arm64` and pushes it to the GitHub Container Registry.
+
+Published tags on `ghcr.io/lepinkainen/omdb-proxy`:
+
+| Tag | Points at |
+| --- | --- |
+| `latest` | the most recent build of `main` |
+| `main` | the same thing, named by branch |
+| `sha-<full-sha>` | one exact commit, for pinning or rolling back |
+| `1.2.3`, `1.2` | a pushed `v1.2.3` git tag |
+
+Pull requests build the image but don't push it — a fork's token has no write
+access to the registry.
+
+The package inherits the repository's visibility on its first publish. If the
+repo is private and the VPS should still be able to `docker pull`, either make
+the package public from its GitHub page, or log the VPS in with a personal
+access token that has `read:packages`:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u lepinkainen --password-stdin
+```
+
+The Dockerfile cross-compiles rather than emulating: the Go build stage is
+pinned to `$BUILDPLATFORM` and passed `GOARCH=$TARGETARCH`, so the arm64 image
+is produced at native speed on an amd64 runner.

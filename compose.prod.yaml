@@ -1,0 +1,22 @@
+# Deployment compose file for the VPS: pulls the published image instead of
+# building it. `docker compose -f compose.prod.yaml pull && ... up -d` is the
+# whole upgrade procedure.
+#
+# The plain compose.yaml next to this one builds from source and is for local
+# work; nothing here depends on the source tree, so this file plus a .env is
+# all the VPS needs.
+services:
+  omdb-proxy:
+    image: ghcr.io/lepinkainen/omdb-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    env_file:
+      - .env
+    volumes:
+      - omdb-proxy-data:/data
+
+volumes:
+  # Named volume, not a bind mount: losing the cache DB means refilling it at
+  # DAILY_BUDGET requests per day.
+  omdb-proxy-data:

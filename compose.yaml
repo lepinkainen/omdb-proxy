@@ -1,8 +1,8 @@
 services:
   omdb-proxy:
+    # Builds from this checkout. To run the published image instead, use
+    # compose.prod.yaml, which needs no source tree.
     build: .
-    # Or, once an image is published somewhere:
-    # image: ghcr.io/lepinkainen/omdb-proxy:latest
     restart: unless-stopped
     ports:
       - "8090:8090"
