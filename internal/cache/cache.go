@@ -296,6 +296,8 @@ func (s *Store) MarkExhausted(ctx context.Context, now time.Time) error {
 }
 
 // RecordServed records one upstream request that OMDb actually answered.
+// now must be when the request was *issued*, not when its response came
+// back — see the causality note below.
 //
 // It carries the entire recovery rule, which is why it is one statement
 // rather than a read and a branch: if the key was previously refused,
@@ -313,15 +315,31 @@ func (s *Store) MarkExhausted(ctx context.Context, now time.Time) error {
 // OMDb answering — see recognisedEnvelope in the proxy package. A 502
 // HTML page from a CDN and an "Invalid API key!" both lack a quota error
 // while saying nothing about the quota day.
-func (s *Store) RecordServed(ctx context.Context, now time.Time) error {
+//
+// Only a request issued *after* the refusal counts as recovery, which is
+// what the timestamp comparison enforces. Requests for different cache
+// keys run concurrently, so a response accepted by OMDb just before it
+// started refusing can easily be written after MarkExhausted has landed.
+// Treating that late arrival as proof of a rollover would clear a
+// refusal that still stands and, worse, collapse a whole day's measured
+// spend to 1 — turning the dashboard back into the thing that made this
+// bug so hard to diagnose in the first place. Database write order is
+// not causal order; only the issue time is.
+//
+// A success issued in the same second as the refusal is treated as not
+// proving recovery. That is the safe direction: the refusal stands, and
+// the next miss — which every miss is free to make — settles it.
+func (s *Store) RecordServed(ctx context.Context, issuedAt time.Time) error {
 	if _, err := s.db.ExecContext(ctx, `
 		INSERT INTO quota_state (id, used, counting_since, exhausted_at) VALUES (1, 1, ?, NULL)
 		ON CONFLICT(id) DO UPDATE SET
-			used = CASE WHEN exhausted_at IS NULL THEN used + 1 ELSE 1 END,
-			counting_since = CASE WHEN exhausted_at IS NULL
+			used = CASE WHEN exhausted_at IS NULL OR exhausted_at >= excluded.counting_since
+				THEN used + 1 ELSE 1 END,
+			counting_since = CASE WHEN exhausted_at IS NULL OR exhausted_at >= excluded.counting_since
 				THEN counting_since ELSE excluded.counting_since END,
-			exhausted_at = NULL
-	`, now.UTC().Format(time.RFC3339)); err != nil {
+			exhausted_at = CASE WHEN exhausted_at IS NULL OR exhausted_at >= excluded.counting_since
+				THEN exhausted_at ELSE NULL END
+	`, issuedAt.UTC().Format(time.RFC3339)); err != nil {
 		return errors.Wrap(err, "record served request")
 	}
 	return nil

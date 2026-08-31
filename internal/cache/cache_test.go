@@ -230,6 +230,68 @@ func TestRecordServedAfterExhaustionRestartsTheCount(t *testing.T) {
 	}
 }
 
+// TestLateSuccessFromBeforeARefusalIsNotRecovery pins the causality
+// rule. Requests for different cache keys run concurrently, so a
+// response OMDb accepted just before it started refusing can be written
+// after the refusal has landed. Treating that as proof of a rollover
+// would clear a refusal that still stands and collapse the day's
+// measured spend to 1 — which is precisely the "did we spend it or did
+// OMDb cut us off?" blindness this ledger exists to prevent.
+func TestLateSuccessFromBeforeARefusalIsNotRecovery(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	issuedEarly := quotaTestClock
+	for i := 0; i < 4; i++ {
+		if err := store.RecordServed(ctx, issuedEarly); err != nil {
+			t.Fatalf("RecordServed: %v", err)
+		}
+	}
+
+	refusedAt := quotaTestClock.Add(time.Minute)
+	if err := store.MarkExhausted(ctx, refusedAt); err != nil {
+		t.Fatalf("MarkExhausted: %v", err)
+	}
+
+	// A request issued before the refusal, landing after it.
+	if err := store.RecordServed(ctx, refusedAt.Add(-30*time.Second)); err != nil {
+		t.Fatalf("RecordServed (late arrival): %v", err)
+	}
+
+	got, err := store.Quota(ctx, refusedAt)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.ExhaustedAt == nil {
+		t.Fatal("the refusal was cleared by a request issued before it, want it kept")
+	}
+	if !got.ExhaustedAt.Equal(refusedAt) {
+		t.Errorf("ExhaustedAt = %v, want %v", got.ExhaustedAt, refusedAt)
+	}
+	if got.Used != 5 {
+		t.Errorf("Used = %d, want 5: the late arrival is still a served request, just not a rollover", got.Used)
+	}
+	if !got.CountingSince.Equal(quotaTestClock) {
+		t.Errorf("CountingSince = %v, want %v (unmoved)", got.CountingSince, quotaTestClock)
+	}
+
+	// A request issued after the refusal is the real thing.
+	rollover := refusedAt.Add(time.Hour)
+	if err := store.RecordServed(ctx, rollover); err != nil {
+		t.Fatalf("RecordServed (after the refusal): %v", err)
+	}
+	got, err = store.Quota(ctx, rollover)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil", got.ExhaustedAt)
+	}
+	if got.Used != 1 || !got.CountingSince.Equal(rollover) {
+		t.Errorf("Quota = %+v, want used=1 counting from %v", got, rollover)
+	}
+}
+
 // TestMarkExhaustedNeverWindsTheTimestampBack guards the MAX in the
 // upsert, so a slightly stale caller cannot rewrite when upstream
 // refused us.

@@ -174,7 +174,15 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, store := newTestHandler(t, upstream.URL)
+	// A movable clock, because recovery is only credited to a request
+	// issued strictly after the refusal it clears. Stored timestamps are
+	// second-granular, so a retry in the same second as the refusal is
+	// deliberately not treated as proof of a rollover.
+	refusedAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	clock := &atomic.Pointer[time.Time]{}
+	clock.Store(&refusedAt)
+
+	h, store := newTestHandlerWithClock(t, upstream.URL, clock)
 
 	first := doRequest(t, h, "i=tt0137523&apikey=client-key")
 	if first.Code != http.StatusUnauthorized {
@@ -197,6 +205,8 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 	// A second request for the same query tries upstream again, and this
 	// time OMDb answers — which is exactly how the proxy learns the
 	// quota day has rolled over. Nothing was cached to stop it trying.
+	retriedAt := refusedAt.Add(time.Minute)
+	clock.Store(&retriedAt)
 	second := doRequest(t, h, "i=tt0137523&apikey=client-key")
 	if second.Code != http.StatusOK {
 		t.Errorf("second request status = %d, want 200", second.Code)
@@ -217,7 +227,7 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 		t.Fatal("the served response was not cached")
 	}
 
-	quota, err := store.Quota(t.Context(), time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC))
+	quota, err := store.Quota(t.Context(), retriedAt)
 	if err != nil {
 		t.Fatalf("store.Quota: %v", err)
 	}
