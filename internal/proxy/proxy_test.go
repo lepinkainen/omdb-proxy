@@ -1031,3 +1031,137 @@ func decodeStats(t *testing.T, h *proxy.Handler, into any) {
 		t.Fatalf("decode /stats: %v", err)
 	}
 }
+
+// TestInconclusiveProbeKeepsBreakerArmed covers the two ways a probe can
+// come back without a transport error and still prove nothing: an HTML
+// error page from something between us and OMDb, and OMDb rejecting the
+// key outright. Neither says a new quota day has begun, and treating
+// either as recovery would resume full-rate traffic into a key that is
+// still refused.
+func TestInconclusiveProbeKeepsBreakerArmed(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{"gateway error page", http.StatusBadGateway, "text/html", "<html><body>502 Bad Gateway</body></html>"},
+		{"html body with a 200", http.StatusOK, "text/html", "<html><body>hello</body></html>"},
+		{"invalid api key", http.StatusUnauthorized, "application/json", `{"Response":"False","Error":"Invalid API key!"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				calls     int32
+				exhausted atomic.Bool
+			)
+			exhausted.Store(true)
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				if exhausted.Load() {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnauthorized)
+					fmt.Fprint(w, quotaJSON)
+					return
+				}
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer upstream.Close()
+
+			const probeInterval = 15 * time.Minute
+			start := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+			clock := &atomic.Pointer[time.Time]{}
+			clock.Store(&start)
+
+			h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
+
+			// Arm the breaker with a real quota error.
+			doRequest(t, h, "i=tt0137523&apikey=client-key")
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("upstream calls = %d, want 1", got)
+			}
+
+			// Probe, and get something that is not an OMDb answer.
+			exhausted.Store(false)
+			probeTime := start.Add(probeInterval)
+			clock.Store(&probeTime)
+			doRequest(t, h, "i=tt9999999&apikey=client-key")
+			if got := atomic.LoadInt32(&calls); got != 2 {
+				t.Fatalf("upstream calls = %d, want 2 (the probe itself)", got)
+			}
+
+			quota, err := store.Quota(t.Context(), "2026-08-30")
+			if err != nil {
+				t.Fatalf("store.Quota: %v", err)
+			}
+			if quota.ExhaustedAt == nil {
+				t.Fatal("breaker closed on an inconclusive probe, want it left armed")
+			}
+			if !quota.ExhaustedAt.Equal(probeTime) {
+				t.Errorf("ExhaustedAt = %v, want %v (the probe re-arms from its own moment)", quota.ExhaustedAt, probeTime)
+			}
+			if quota.Used == 1 {
+				t.Error("Used = 1, i.e. the counter was reset: an inconclusive probe must not start a fresh budget")
+			}
+
+			// And traffic stays blocked rather than resuming at full rate.
+			justAfter := probeTime.Add(time.Minute)
+			clock.Store(&justAfter)
+			for i := 0; i < 3; i++ {
+				doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
+			}
+			if got := atomic.LoadInt32(&calls); got != 2 {
+				t.Errorf("upstream calls = %d, want 2 (breaker must still absorb misses)", got)
+			}
+		})
+	}
+}
+
+// TestProbeRecoversOnAnOrdinaryMiss pins the other side of that bar: a
+// plain "Movie not found!" is a 200 with a real OMDb envelope, which is
+// proof the key was served and therefore proof of a new quota day.
+func TestProbeRecoversOnAnOrdinaryMiss(t *testing.T) {
+	var (
+		calls     int32
+		exhausted atomic.Bool
+	)
+	exhausted.Store(true)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if exhausted.Load() {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, quotaJSON)
+			return
+		}
+		fmt.Fprint(w, notFoundJSON)
+	}))
+	defer upstream.Close()
+
+	const probeInterval = 15 * time.Minute
+	start := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+	clock := &atomic.Pointer[time.Time]{}
+	clock.Store(&start)
+
+	h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
+
+	doRequest(t, h, "i=tt0137523&apikey=client-key")
+	exhausted.Store(false)
+	probeTime := start.Add(probeInterval)
+	clock.Store(&probeTime)
+	doRequest(t, h, "i=tt9999999&apikey=client-key")
+
+	quota, err := store.Quota(t.Context(), "2026-08-30")
+	if err != nil {
+		t.Fatalf("store.Quota: %v", err)
+	}
+	if quota.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil: a served miss proves the key works", quota.ExhaustedAt)
+	}
+	if quota.Used != 1 {
+		t.Errorf("Used = %d, want 1 (fresh budget, minus the probe)", quota.Used)
+	}
+}

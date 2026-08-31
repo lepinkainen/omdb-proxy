@@ -345,11 +345,23 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 
 	if reservation.Probe {
 		// This request went upstream only because the breaker was due a
-		// probe, and upstream answered normally — so OMDb has rolled
-		// into a fresh quota day. MarkRecovered closes the breaker and
-		// restarts the day's counter, which is what keeps our budget
-		// aligned to OMDb's day rather than to UTC midnight.
-		if err := h.store.MarkRecovered(ctx, day); err != nil {
+		// probe. Closing the breaker hands the proxy a fresh budget, so
+		// the bar for it is proof that OMDb served us — an ordinary
+		// answer, hit or miss, with a 200. "Not a quota error" is not
+		// that proof: a 502 HTML page from a CDN and an "Invalid API
+		// key!" both clear that bar while telling us nothing about the
+		// quota day, and believing either would resume full-rate
+		// traffic into a key that is still refused.
+		if status != http.StatusOK || !recognisedEnvelope(body, contentType) {
+			// The probe already pushed the breaker's timer forward, so
+			// an inconclusive answer simply costs one more interval of
+			// waiting rather than a wrong reset.
+			h.logger.Warn("upstream quota probe inconclusive",
+				"day", day,
+				"status", status,
+				"next_probe_after", h.probeInterval.String(),
+			)
+		} else if err := h.store.MarkRecovered(ctx, day); err != nil {
 			h.logger.Error("record upstream quota recovery", "error", err.Error())
 		} else {
 			h.logger.Info("upstream quota recovered", "day", day, "budget", h.budget)
