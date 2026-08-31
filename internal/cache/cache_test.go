@@ -2,7 +2,10 @@ package cache
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+
+	"github.com/cockroachdb/errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -136,135 +139,234 @@ func TestPermanentEntryHasNilExpiry(t *testing.T) {
 	}
 }
 
-func TestTryReserveQuotaEnforcesBudget(t *testing.T) {
+// quotaTestClock is an arbitrary fixed instant; quota tests move
+// relative to it rather than to the wall clock.
+var quotaTestClock = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+
+func TestRecordServedCountsUpstreamRequests(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
-	const day = "2026-08-30"
 
-	ok, used, err := store.TryReserveQuota(ctx, day, 2)
-	if err != nil || !ok || used != 1 {
-		t.Fatalf("1st reservation: ok=%v used=%d err=%v, want ok=true used=1", ok, used, err)
-	}
-
-	ok, used, err = store.TryReserveQuota(ctx, day, 2)
-	if err != nil || !ok || used != 2 {
-		t.Fatalf("2nd reservation: ok=%v used=%d err=%v, want ok=true used=2", ok, used, err)
-	}
-
-	ok, used, err = store.TryReserveQuota(ctx, day, 2)
-	if err != nil || ok {
-		t.Fatalf("3rd reservation: ok=%v used=%d err=%v, want ok=false (budget exhausted)", ok, used, err)
-	}
-
-	got, err := store.QuotaUsed(ctx, day)
-	if err != nil {
-		t.Fatalf("QuotaUsed: %v", err)
-	}
-	if got != 2 {
-		t.Errorf("QuotaUsed = %d, want 2", got)
-	}
-}
-
-func TestMarkExhaustedForcesUsedToAtLeastBudget(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-	const day = "2026-08-30"
-
-	if err := store.MarkExhausted(ctx, day, 900); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
-	}
-
-	got, err := store.QuotaUsed(ctx, day)
-	if err != nil {
-		t.Fatalf("QuotaUsed: %v", err)
-	}
-	if got != 900 {
-		t.Errorf("QuotaUsed = %d, want 900", got)
-	}
-
-	// TryReserveQuota must now refuse for the rest of the day.
-	reserved, used, err := store.TryReserveQuota(ctx, day, 900)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if reserved {
-		t.Error("reserved = true, want false (budget marked exhausted)")
-	}
-	if used != 900 {
-		t.Errorf("used = %d, want 900", used)
-	}
-
-	// A different day must be entirely unaffected — this is the whole
-	// reset story: the marker is keyed by UTC day like the rest of the
-	// quota accounting, so it clears itself at UTC midnight along with
-	// everything else, rather than needing any explicit cleanup.
-	otherDayUsed, err := store.QuotaUsed(ctx, "2026-08-31")
-	if err != nil {
-		t.Fatalf("QuotaUsed(other day): %v", err)
-	}
-	if otherDayUsed != 0 {
-		t.Errorf("QuotaUsed(other day) = %d, want 0 (marker must not leak across days)", otherDayUsed)
-	}
-}
-
-func TestMarkExhaustedIsIdempotentAndNeverLowersCounter(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-	const day = "2026-08-30"
-
-	// Push the counter above a hypothetical "budget" first, as
-	// concurrent traffic reserving quota might.
-	for i := 0; i < 5; i++ {
-		if _, _, err := store.TryReserveQuota(ctx, day, 1000); err != nil {
-			t.Fatalf("TryReserveQuota: %v", err)
+	for i := 0; i < 3; i++ {
+		if err := store.RecordServed(ctx, quotaTestClock); err != nil {
+			t.Fatalf("RecordServed: %v", err)
 		}
 	}
-	got, err := store.QuotaUsed(ctx, day)
-	if err != nil {
-		t.Fatalf("QuotaUsed: %v", err)
-	}
-	if got != 5 {
-		t.Fatalf("QuotaUsed = %d, want 5 before MarkExhausted", got)
-	}
 
-	// A MarkExhausted call with a budget lower than the current counter
-	// must not claw the counter back down — the upsert only ever
-	// raises it.
-	if err := store.MarkExhausted(ctx, day, 3); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
-	}
-	got, err = store.QuotaUsed(ctx, day)
+	got, err := store.Quota(ctx, quotaTestClock)
 	if err != nil {
-		t.Fatalf("QuotaUsed: %v", err)
+		t.Fatalf("Quota: %v", err)
 	}
-	if got != 5 {
-		t.Errorf("QuotaUsed = %d, want 5 (MarkExhausted must never lower an already-higher counter)", got)
+	if got.Used != 3 {
+		t.Errorf("Used = %d, want 3", got.Used)
 	}
-
-	// Calling it repeatedly with the same budget is idempotent.
-	if err := store.MarkExhausted(ctx, day, 900); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
+	if got.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil", got.ExhaustedAt)
 	}
-	if err := store.MarkExhausted(ctx, day, 900); err != nil {
-		t.Fatalf("MarkExhausted (again): %v", err)
-	}
-	got, err = store.QuotaUsed(ctx, day)
-	if err != nil {
-		t.Fatalf("QuotaUsed: %v", err)
-	}
-	if got != 900 {
-		t.Errorf("QuotaUsed = %d, want 900", got)
+	if !got.CountingSince.Equal(quotaTestClock) {
+		t.Errorf("CountingSince = %v, want %v (the first request starts the count)", got.CountingSince, quotaTestClock)
 	}
 }
 
-func TestQuotaUsedForUnknownDayIsZero(t *testing.T) {
+// TestRecordServedAfterExhaustionRestartsTheCount is the whole recovery
+// rule. OMDb exposes no way to read remaining quota and documents no
+// reset time, so a request it actually answers, after refusing us, is
+// the only evidence its day has rolled over.
+func TestRecordServedAfterExhaustionRestartsTheCount(t *testing.T) {
 	store := openTestStore(t)
-	used, err := store.QuotaUsed(context.Background(), "1999-01-01")
-	if err != nil {
-		t.Fatalf("QuotaUsed: %v", err)
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		if err := store.RecordServed(ctx, quotaTestClock); err != nil {
+			t.Fatalf("RecordServed: %v", err)
+		}
 	}
-	if used != 0 {
-		t.Errorf("QuotaUsed = %d, want 0", used)
+	if err := store.MarkExhausted(ctx, quotaTestClock.Add(time.Hour)); err != nil {
+		t.Fatalf("MarkExhausted: %v", err)
+	}
+
+	// Still five: being refused is not spending.
+	got, err := store.Quota(ctx, quotaTestClock)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.Used != 5 {
+		t.Errorf("Used = %d, want 5: MarkExhausted must record what upstream said, not rewrite what we spent", got.Used)
+	}
+	if got.ExhaustedAt == nil {
+		t.Fatal("ExhaustedAt = nil, want the refusal recorded")
+	}
+
+	// Hours later OMDb answers again: a new quota day.
+	rollover := quotaTestClock.Add(9 * time.Hour)
+	if err := store.RecordServed(ctx, rollover); err != nil {
+		t.Fatalf("RecordServed: %v", err)
+	}
+
+	got, err = store.Quota(ctx, rollover)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.Used != 1 {
+		t.Errorf("Used = %d, want 1: the answering request is the first of the new day", got.Used)
+	}
+	if got.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil once upstream answers again", got.ExhaustedAt)
+	}
+	if !got.CountingSince.Equal(rollover) {
+		t.Errorf("CountingSince = %v, want %v (the observed rollover)", got.CountingSince, rollover)
+	}
+
+	// And the next one increments from there rather than restarting.
+	if err := store.RecordServed(ctx, rollover.Add(time.Minute)); err != nil {
+		t.Fatalf("RecordServed: %v", err)
+	}
+	got, err = store.Quota(ctx, rollover)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.Used != 2 || !got.CountingSince.Equal(rollover) {
+		t.Errorf("Quota = %+v, want used=2 counting from %v", got, rollover)
+	}
+}
+
+// TestLateSuccessFromBeforeARefusalIsNotRecovery pins the causality
+// rule. Requests for different cache keys run concurrently, so a
+// response OMDb accepted just before it started refusing can be written
+// after the refusal has landed. Treating that as proof of a rollover
+// would clear a refusal that still stands and collapse the day's
+// measured spend to 1 — which is precisely the "did we spend it or did
+// OMDb cut us off?" blindness this ledger exists to prevent.
+func TestLateSuccessFromBeforeARefusalIsNotRecovery(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	issuedEarly := quotaTestClock
+	for i := 0; i < 4; i++ {
+		if err := store.RecordServed(ctx, issuedEarly); err != nil {
+			t.Fatalf("RecordServed: %v", err)
+		}
+	}
+
+	refusedAt := quotaTestClock.Add(time.Minute)
+	if err := store.MarkExhausted(ctx, refusedAt); err != nil {
+		t.Fatalf("MarkExhausted: %v", err)
+	}
+
+	// A request issued before the refusal, landing after it.
+	if err := store.RecordServed(ctx, refusedAt.Add(-30*time.Second)); err != nil {
+		t.Fatalf("RecordServed (late arrival): %v", err)
+	}
+
+	got, err := store.Quota(ctx, refusedAt)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.ExhaustedAt == nil {
+		t.Fatal("the refusal was cleared by a request issued before it, want it kept")
+	}
+	if !got.ExhaustedAt.Equal(refusedAt) {
+		t.Errorf("ExhaustedAt = %v, want %v", got.ExhaustedAt, refusedAt)
+	}
+	if got.Used != 5 {
+		t.Errorf("Used = %d, want 5: the late arrival is still a served request, just not a rollover", got.Used)
+	}
+	if !got.CountingSince.Equal(quotaTestClock) {
+		t.Errorf("CountingSince = %v, want %v (unmoved)", got.CountingSince, quotaTestClock)
+	}
+
+	// A request issued after the refusal is the real thing.
+	rollover := refusedAt.Add(time.Hour)
+	if err := store.RecordServed(ctx, rollover); err != nil {
+		t.Fatalf("RecordServed (after the refusal): %v", err)
+	}
+	got, err = store.Quota(ctx, rollover)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil", got.ExhaustedAt)
+	}
+	if got.Used != 1 || !got.CountingSince.Equal(rollover) {
+		t.Errorf("Quota = %+v, want used=1 counting from %v", got, rollover)
+	}
+}
+
+// TestMarkExhaustedNeverWindsTheTimestampBack guards the MAX in the
+// upsert, so a slightly stale caller cannot rewrite when upstream
+// refused us.
+func TestMarkExhaustedNeverWindsTheTimestampBack(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
+		t.Fatalf("MarkExhausted: %v", err)
+	}
+	if err := store.MarkExhausted(ctx, quotaTestClock.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("MarkExhausted (stale): %v", err)
+	}
+
+	got, err := store.Quota(ctx, quotaTestClock)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.ExhaustedAt == nil || !got.ExhaustedAt.Equal(quotaTestClock) {
+		t.Errorf("ExhaustedAt = %v, want %v", got.ExhaustedAt, quotaTestClock)
+	}
+}
+
+func TestQuotaOnAnEmptyLedgerIsZero(t *testing.T) {
+	store := openTestStore(t)
+	got, err := store.Quota(context.Background(), quotaTestClock)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.Used != 0 || got.ExhaustedAt != nil {
+		t.Errorf("Quota = %+v, want an unspent ledger", got)
+	}
+	if !got.CountingSince.Equal(quotaTestClock) {
+		t.Errorf("CountingSince = %v, want now (%v)", got.CountingSince, quotaTestClock)
+	}
+}
+
+// TestOpenDropsTheLegacyDayKeyedQuotaTable covers upgrading a deployed
+// database. The old rows counted spend within a UTC calendar day, which
+// this proxy no longer tracks, and rows written by the pre-breaker code
+// hold a forged used value. The drop has to happen before the schema is
+// applied, or a legacy database would be read on the old shape.
+func TestOpenDropsTheLegacyDayKeyedQuotaTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE quota (day TEXT PRIMARY KEY, used INTEGER NOT NULL);
+		INSERT INTO quota (day, used) VALUES ('2026-08-31', 900);`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy handle: %v", err)
+	}
+
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open on a pre-simplification database: %v", err)
+	}
+	defer store.Close()
+
+	var name string
+	err = store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quota'`).Scan(&name)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("legacy quota table still present (err=%v), want it dropped", err)
+	}
+
+	got, err := store.Quota(context.Background(), quotaTestClock)
+	if err != nil {
+		t.Fatalf("Quota after migration: %v", err)
+	}
+	if got.Used != 0 {
+		t.Errorf("Used = %d, want 0: a forged legacy counter must not carry over", got.Used)
 	}
 }
 

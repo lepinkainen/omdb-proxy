@@ -59,10 +59,17 @@ func formatExpiry(exp *time.Time, now time.Time) string {
 type indexPageData struct {
 	Now time.Time
 
-	QuotaUsedToday int
-	QuotaBudget    int
-	QuotaRemaining int
-	QuotaExhausted bool
+	// QuotaUsed is spend since QuotaCountingSince, not "today": OMDb's
+	// quota day does not start at UTC midnight and it publishes no
+	// reset time, so the page shows the real boundary it knows.
+	QuotaUsed          int
+	QuotaCountingSince time.Time
+
+	// QuotaExhausted reports what OMDb last told us. It gates nothing —
+	// the next cache miss tries upstream either way — so the page says
+	// "refusing" rather than implying the proxy has stopped.
+	QuotaExhausted   bool
+	QuotaExhaustedAt *time.Time
 
 	Stats  cache.Stats
 	Recent []cache.Summary
@@ -85,21 +92,16 @@ type indexPageData struct {
 func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.Time) {
 	ctx := r.Context()
 	now := h.now()
-	day := now.UTC().Format("2006-01-02")
 
 	// The quota read mirrors StatsHandler's: if we can't even tell the
 	// operator how much budget is left, the page isn't worth serving
 	// half-broken, so this one failure is fatal like it is in /stats.
-	used, err := h.store.QuotaUsed(ctx, day)
+	quota, err := h.quotaView(ctx, now)
 	if err != nil {
 		h.logger.Error("index: read quota", "error", err.Error())
 		h.logRequest("", "INDEX", http.StatusInternalServerError, start)
 		http.Error(w, "omdb-proxy: failed to read quota", http.StatusInternalServerError)
 		return
-	}
-	remaining := h.budget - used
-	if remaining < 0 {
-		remaining = 0
 	}
 
 	// Everything below is best-effort: a failure to read cache-wide
@@ -126,10 +128,11 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.
 	data := indexPageData{
 		Now: now,
 
-		QuotaUsedToday: used,
-		QuotaBudget:    h.budget,
-		QuotaRemaining: remaining,
-		QuotaExhausted: remaining == 0,
+		QuotaUsed:          quota.Used,
+		QuotaCountingSince: quota.CountingSince,
+
+		QuotaExhausted:   quota.ExhaustedAt != nil,
+		QuotaExhaustedAt: quota.ExhaustedAt,
 
 		Stats:  cacheStats,
 		Recent: recent,

@@ -91,6 +91,32 @@ func parseEnvelope(body []byte, contentType string) (found bool, quotaError bool
 	return found, quotaError, year, yearOK
 }
 
+// recognisedEnvelope reports whether body is recognisably OMDb
+// answering, rather than something else that merely arrived without a
+// transport error: an HTML error page from a CDN or reverse proxy, an
+// interstitial, an empty body.
+//
+// parseEnvelope deliberately degrades to a substring scan on an
+// unparseable body, which is right for its job (never miss a quota
+// error) but useless as evidence that the key works. The circuit
+// breaker needs the opposite guarantee — proof of an ordinary OMDb
+// answer before it believes a new quota day has begun — so it asks this
+// instead. Both a hit and a plain miss qualify: every real OMDb answer
+// carries the Response field, and either value proves the key was
+// served.
+func recognisedEnvelope(body []byte, contentType string) bool {
+	if strings.Contains(strings.ToLower(contentType), "xml") {
+		m := xmlResponseAttr.FindSubmatch(body)
+		return m != nil && (strings.EqualFold(string(m[1]), "true") || strings.EqualFold(string(m[1]), "false"))
+	}
+
+	var env omdbEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return false
+	}
+	return strings.EqualFold(env.Response, "true") || strings.EqualFold(env.Response, "false")
+}
+
 // parseXMLEnvelope handles OMDb's r=xml format, e.g.
 // `<root response="False"><error>Movie not found!</error></root>` for a
 // miss, or `<root response="True"><movie ... year="1999" .../></root>`

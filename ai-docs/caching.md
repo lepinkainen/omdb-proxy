@@ -35,7 +35,7 @@ These are the parts of OMDb's actual behaviour that are easy to get wrong and ex
 
 1. **OMDb signals failure in the response body, and the paired HTTP status is inconsistent.** An ordinary miss is HTTP 200 with `{"Response":"False","Error":"Incorrect IMDb ID."}`. An exhausted quota is HTTP 401 with the *same shape*, `{"Response":"False","Error":"Request limit reached!"}`. The proxy always decodes the body before trusting the status code, and detects a quota error by matching `request limit` case-insensitively against the `Error` field rather than pinning OMDb's exact wording.
 2. **A quota-exceeded response is never cached.** It's a fact about the proxy's key on that particular day, not a fact about the movie. Caching it would poison that cache entry permanently.
-3. **A decoded quota error trips a local circuit breaker for the rest of the UTC day.** The daily budget counter is only ever a prediction of OMDb's real counter, and the two can disagree — the cache DB gets recreated, the budget gets raised, or something else spends requests against the same key. A quota error from upstream is ground truth that the prediction was wrong, so the proxy immediately marks the day's budget as fully spent rather than waiting for its own counter to catch up. Without this, every later cache miss that day would make its own doomed upstream call to rediscover the same exhausted key — and if a stale entry happens to exist for one of those misses, the consumer gets a perfectly good `STALE` response and never even sees the quota error to react to, so nothing else would stop the loop.
+3. **A decoded quota error is remembered, but it does not stop anything.** Every cache miss tries upstream, including the next one after a refusal. That is not an oversight: OMDb exposes no way to read remaining quota and documents no reset time, so a request it actually answers is the only evidence its day has rolled over, and declining to make that request is declining to ever find out. The proxy therefore records *that* it was refused (`exhausted_at`) purely so the next served response is meaningful — when one arrives, `RecordServed` clears the refusal and restarts the counter from that moment. "Served" means HTTP 200 with a recognisable OMDb envelope, hit or miss, rather than merely a body without a quota error in it: a 502 HTML page and an `Invalid API key!` both clear that weaker bar while saying nothing about the quota day. The cost of this design is that a run of misses against an exhausted key makes a run of doomed upstream calls; they cost latency rather than quota, since upstream is already refusing them. Every attempt to avoid that cost — a breaker latched to UTC midnight, a minimum probe interval, a local daily cap — has been tried in this repo and each one cost an outage or a wasted budget, so do not reintroduce one.
 4. **Not-found misses are cached** (with the finite TTL above), so a typo'd id or a genuinely absent title isn't retried on every single pass.
 5. **Upstream failures serve stale data instead of failing.** If the upstream request errors, times out, or the daily budget is already spent, and an expired cache entry exists for that query, the proxy returns the stale body with `X-Cache: STALE` rather than an error. Consumers never see a hard failure just because the proxy is temporarily out of quota.
 6. **A miss with no stale fallback and an exhausted budget returns OMDb's own quota body verbatim** — `{"Response":"False","Error":"Request limit reached!"}`, HTTP 401 — without making an upstream call to get it. Existing OMDb clients already know how to recognise this shape and abort their enrichment pass cleanly; that's exactly the behaviour this proxy wants to preserve.
@@ -61,13 +61,19 @@ CREATE TABLE IF NOT EXISTS responses (
     expires_at  TEXT                -- RFC3339 UTC; NULL = permanent
 );
 
-CREATE TABLE IF NOT EXISTS quota (
-    day  TEXT PRIMARY KEY,          -- YYYY-MM-DD in UTC
-    used INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS quota_state (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    used           INTEGER NOT NULL, -- requests OMDb actually served
+    counting_since TEXT NOT NULL,    -- RFC3339 UTC; last observed upstream rollover
+    exhausted_at   TEXT              -- RFC3339 UTC; NULL = OMDb is serving us
 );
 ```
 
-WAL mode and a busy timeout are enabled at startup. The quota counter increments once per request actually sent upstream, keyed by UTC day, because OMDb's own limit resets at UTC midnight.
+WAL mode and a busy timeout are enabled at startup. `used` increments once per request actually sent upstream and is a real measurement — nothing ever forges it to trip the breaker, because that would make a forfeited day indistinguishable from a spent one. `exhausted_at` is when upstream last refused the key, or last handed out a probe; it is the breaker.
+
+The ledger holds exactly one row and stores one decision-bearing fact: is OMDb refusing us right now. `used` and `counting_since` are reporting only — nothing reads them to decide anything — and they answer "how much have we spent since OMDb last rolled over?", which is the only period boundary the API ever makes visible. On a proxy that is never refused, the count simply climbs from first use; the dashboard shows the real timestamp rather than implying "today".
+
+`Open` drops a pre-existing day-keyed `quota` table, before applying the schema so a legacy database is never read on the old shape. Those rows counted spend within a UTC calendar day, which this proxy no longer tracks, and rows written by the pre-breaker code hold a forged `used`. Starting the counter fresh costs nothing now that it is a reporting number rather than a limit.
 
 ## Logs
 

@@ -139,12 +139,13 @@
   <div class="grid">
     <div class="card">
       <h2>Quota</h2>
-      <div class="big {{if .QuotaExhausted}}exhausted{{else}}ok{{end}}">{{.QuotaRemaining}}</div>
-      <div>remaining today &mdash; {{.QuotaUsedToday}} / {{.QuotaBudget}} used</div>
+      <div class="big {{if .QuotaExhausted}}exhausted{{else}}ok{{end}}">{{.QuotaUsed}}</div>
+      <div>upstream requests served since {{utcTime .QuotaCountingSince}}</div>
       {{if .QuotaExhausted}}
-      <div class="note">Budget exhausted for today. The circuit breaker is tripped: the proxy will serve stale/cached data or OMDb's own quota error rather than calling upstream again until the day resets.</div>
+      <div class="note"><strong>OMDb is refusing this key</strong> &mdash; it last said so at {{utcTimePtr .QuotaExhaustedAt}}. Cached and stale responses are still being served. The next cache miss will try upstream again anyway: OMDb publishes no way to ask how much quota is left, so a request it actually answers is the only signal that its day has rolled over. When one does, the count above starts again from there.</div>
+      {{else}}
+      <div class="note">OMDb is serving normally. There is no local budget &mdash; OMDb&#39;s own refusal is the limit, and the count above is spend since it last rolled over.</div>
       {{end}}
-      <div class="note">Day is UTC; resets at midnight UTC.</div>
     </div>
 
     <div class="card">
