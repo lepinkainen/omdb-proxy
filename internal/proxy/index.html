@@ -4,131 +4,48 @@
 <meta charset="utf-8">
 <title>omdb-proxy</title>
 <style>
-  :root {
-    --bg: #f7f7f8;
-    --fg: #1a1a1a;
-    --muted: #666;
-    --card-bg: #ffffff;
-    --border: #ddd;
-    --accent: #2a6f97;
-    --ok: #2e7d32;
-    --bad: #c62828;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #16171a;
-      --fg: #e6e6e6;
-      --muted: #999;
-      --card-bg: #1f2023;
-      --border: #333;
-      --accent: #6cb2eb;
-      --ok: #66bb6a;
-      --bad: #ef5350;
-    }
-  }
   * { box-sizing: border-box; }
   body {
-    margin: 0;
-    padding: 1.5rem;
-    background: var(--bg);
-    color: var(--fg);
+    margin: 0; padding: 1.5rem;
+    background: #f7f7f8; color: #1a1a1a;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     line-height: 1.4;
   }
-  h1 {
-    margin: 0 0 0.25rem 0;
-    font-size: 1.4rem;
-  }
-  .subtitle {
-    color: var(--muted);
-    margin: 0 0 1.25rem 0;
-    font-size: 0.9rem;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-  }
-  .card {
-    background: var(--card-bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1rem 1.25rem;
-  }
-  .card h2 {
-    margin: 0 0 0.6rem 0;
-    font-size: 0.85rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--muted);
-  }
-  .big {
-    font-size: 2.2rem;
-    font-weight: 600;
-    line-height: 1;
-    margin-bottom: 0.35rem;
-  }
-  .big.exhausted { color: var(--bad); }
-  .big.ok { color: var(--ok); }
-  .note {
-    color: var(--muted);
-    font-size: 0.82rem;
-    margin-top: 0.5rem;
-  }
-  dl {
-    margin: 0;
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 0.15rem 0.6rem;
-    font-size: 0.92rem;
-  }
-  dt { color: var(--muted); }
-  dd { margin: 0; text-align: right; font-family: var(--mono); }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-family: var(--mono);
-    font-size: 0.82rem;
-    background: var(--card-bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  th, td {
-    text-align: left;
-    padding: 0.45rem 0.6rem;
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
-  }
-  th {
-    color: var(--muted);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-weight: 600;
-    font-size: 0.78rem;
-    text-transform: uppercase;
-  }
-  td.query {
-    white-space: normal;
-    word-break: break-all;
-    max-width: 30rem;
-  }
-  tr:last-child td { border-bottom: none; }
-  .table-wrap { overflow-x: auto; }
-  .yes { color: var(--ok); }
-  .no { color: var(--muted); }
-  .expired { color: var(--bad); }
-  footer {
-    margin-top: 1.5rem;
-    color: var(--muted);
-    font-size: 0.85rem;
-  }
-  footer a { color: var(--accent); }
+  h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  .subtitle, .card h2, .note, dt, th, .no { color: #666; }
+  .subtitle { margin: 0 0 1.25rem; font-size: 0.9rem; }
+  .card h2 { margin: 0 0 0.6rem; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; }
+  .big { font-size: 2.2rem; font-weight: 600; line-height: 1; margin-bottom: 0.35rem; }
+  .big.exhausted, .expired { color: #c62828; }
+  .big.ok, .yes { color: #2e7d32; }
+  .note { margin-top: 0.5rem; font-size: 0.82rem; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.6rem; font-size: 0.92rem; }
+  dd { margin: 0; text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   section { margin-bottom: 1.5rem; }
-  section > h2 {
-    font-size: 1rem;
-    margin: 0 0 0.6rem 0;
+  section > h2 { font-size: 1rem; margin: 0 0 0.6rem; }
+  .table-wrap { overflow-x: auto; }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 0.82rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #fff; border: 1px solid #ddd; border-radius: 8px;
+  }
+  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #ddd; white-space: nowrap; }
+  th { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; }
+  td.query { white-space: normal; word-break: break-all; max-width: 30rem; }
+  tr:last-child td { border-bottom: none; }
+  footer { margin-top: 1.5rem; color: #666; font-size: 0.85rem; }
+  footer a { color: #2a6f97; }
+
+  @media (prefers-color-scheme: dark) {
+    body { background: #16171a; color: #e6e6e6; }
+    .subtitle, .card h2, .note, dt, th, .no, footer { color: #999; }
+    .card, table { background: #1f2023; border-color: #333; }
+    th, td { border-color: #333; }
+    .big.exhausted, .expired { color: #ef5350; }
+    .big.ok, .yes { color: #66bb6a; }
+    footer a { color: #6cb2eb; }
   }
 </style>
 </head>
@@ -142,7 +59,7 @@
       <div class="big {{if .QuotaExhausted}}exhausted{{else}}ok{{end}}">{{.QuotaUsed}}</div>
       <div>upstream requests served since {{utcTime .QuotaCountingSince}}</div>
       {{if .QuotaExhausted}}
-      <div class="note"><strong>OMDb is refusing this key</strong> &mdash; it last said so at {{utcTimePtr .QuotaExhaustedAt}}. Cached and stale responses are still being served. The next cache miss will try upstream again anyway: OMDb publishes no way to ask how much quota is left, so a request it actually answers is the only signal that its day has rolled over. When one does, the count above starts again from there.</div>
+      <div class="note"><strong>OMDb is refusing this key</strong> &mdash; it last said so at {{utcTime .QuotaExhaustedAt}}. Cached and stale responses are still being served. The next cache miss will try upstream again anyway: OMDb publishes no way to ask how much quota is left, so a request it actually answers is the only signal that its day has rolled over. When one does, the count above starts again from there.</div>
       {{else}}
       <div class="note">OMDb is serving normally. There is no local budget &mdash; OMDb&#39;s own refusal is the limit, and the count above is spend since it last rolled over.</div>
       {{end}}
@@ -160,7 +77,7 @@
       </dl>
       <div class="note">Expired rows are kept deliberately &mdash; they're what gets served with X-Cache: STALE when upstream is down or the budget is spent.</div>
       {{if .Stats.OldestFetch}}
-      <div class="note">oldest fetch: {{utcTimePtr .Stats.OldestFetch}} &middot; newest fetch: {{utcTimePtr .Stats.NewestFetch}}</div>
+      <div class="note">oldest entry: {{utcTime .Stats.OldestFetch}}</div>
       {{else}}
       <div class="note">cache is empty</div>
       {{end}}
@@ -169,9 +86,9 @@
     <div class="card">
       <h2>Counters (since process start)</h2>
       <dl>
-        <dt>hits</dt><dd>{{.Hits}}</dd>
-        <dt>misses</dt><dd>{{.Misses}}</dd>
-        <dt>stale</dt><dd>{{.Stales}}</dd>
+        <dt>hits</dt><dd>{{.Counters.Hits}}</dd>
+        <dt>misses</dt><dd>{{.Counters.Misses}}</dd>
+        <dt>stale</dt><dd>{{.Counters.Stales}}</dd>
         <dt>hit rate</dt><dd>{{printf "%.1f" .HitRatePercent}}%</dd>
       </dl>
       <div class="note">In-memory, reset on restart. Quota and cache contents (above) do not.</div>
@@ -199,7 +116,7 @@
           <td>{{if .Found}}<span class="yes">yes</span>{{else}}<span class="no">no</span>{{end}}</td>
           <td>{{.Status}}</td>
           <td>{{utcTime .FetchedAt}}</td>
-          <td>{{$exp := expiry .ExpiresAt $.Now}}{{if eq $exp "expired"}}<span class="expired">expired</span>{{else}}{{$exp}}{{end}}</td>
+          <td>{{expiry .ExpiresAt $.Now}}</td>
         </tr>
         {{end}}
         {{else}}

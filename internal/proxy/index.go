@@ -20,36 +20,33 @@ var indexHTMLFS embed.FS
 // template itself, because it has to render on a bare VPS with no
 // internet access.
 var indexTemplate = template.Must(template.New("index.html").Funcs(template.FuncMap{
-	"utcTime":    formatUTC,
-	"utcTimePtr": formatUTCPtr,
-	"expiry":     formatExpiry,
+	"utcTime": formatUTC,
+	"expiry":  formatExpiry,
 }).ParseFS(indexHTMLFS, "index.html"))
 
 // formatUTC renders t as an absolute UTC timestamp for the index page.
+// text/template indirects a *time.Time argument automatically, so this
+// same func also serves the nullable Stats.OldestFetch field; callers
+// guard the nil case in the template instead of here.
 func formatUTC(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04 UTC")
 }
 
-// formatUTCPtr is formatUTC for the nullable Oldest/NewestFetch fields;
-// the template decides what to show instead when the cache is empty.
-func formatUTCPtr(t *time.Time) string {
-	if t == nil {
-		return ""
-	}
-	return formatUTC(*t)
-}
-
 // formatExpiry renders a cache.Summary's ExpiresAt for the recent-entries
-// table: "never" for a permanent entry, "expired" once now has passed
-// it, otherwise the absolute UTC timestamp.
-func formatExpiry(exp *time.Time, now time.Time) string {
+// table: "never" for a permanent entry, an already-styled "expired" span
+// once now has passed it, otherwise the absolute UTC timestamp. It
+// returns template.HTML (rather than a plain string the template would
+// have to re-parse to style) so it owns the markup outright; the only
+// value it ever interpolates is its own formatUTC output, never anything
+// read from the cache, so this stays safe despite skipping escaping.
+func formatExpiry(exp *time.Time, now time.Time) template.HTML {
 	if exp == nil {
 		return "never"
 	}
 	if !now.Before(*exp) {
-		return "expired"
+		return `<span class="expired">expired</span>`
 	}
-	return formatUTC(*exp)
+	return template.HTML(formatUTC(*exp)) //nolint:gosec // formatUTC's output is our own fixed-format timestamp, never cache data
 }
 
 // indexPageData is everything index.html needs to render. It is built
@@ -74,10 +71,10 @@ type indexPageData struct {
 	Stats  cache.Stats
 	Recent []cache.Summary
 
-	Hits           int64
-	Misses         int64
-	Stales         int64
-	TotalServed    int64
+	// Counters is the in-memory request-count Stats that h.Stats()
+	// already returns; the template reads Hits/Misses/Stales straight
+	// off it instead of the handler copying each field out by hand.
+	Counters       Stats
 	HitRatePercent float64
 }
 
@@ -137,10 +134,7 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.
 		Stats:  cacheStats,
 		Recent: recent,
 
-		Hits:           memStats.Hits,
-		Misses:         memStats.Misses,
-		Stales:         memStats.Stales,
-		TotalServed:    total,
+		Counters:       memStats,
 		HitRatePercent: hitRate,
 	}
 

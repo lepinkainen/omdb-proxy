@@ -401,7 +401,7 @@ func TestStatsCountsPermanentAndExpiringRows(t *testing.T) {
 	}
 }
 
-func TestStatsEmptyCacheHasNilFetchTimes(t *testing.T) {
+func TestStatsEmptyCacheHasNilOldestFetch(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
@@ -414,9 +414,6 @@ func TestStatsEmptyCacheHasNilFetchTimes(t *testing.T) {
 	}
 	if stats.OldestFetch != nil {
 		t.Errorf("OldestFetch = %v, want nil on an empty cache", stats.OldestFetch)
-	}
-	if stats.NewestFetch != nil {
-		t.Errorf("NewestFetch = %v, want nil on an empty cache", stats.NewestFetch)
 	}
 }
 
@@ -454,9 +451,6 @@ func TestStatsCountsFoundNotFoundAndExpiredRows(t *testing.T) {
 	}
 	if stats.OldestFetch == nil || !stats.OldestFetch.Equal(now.Add(-2*time.Hour)) {
 		t.Errorf("OldestFetch = %v, want %v", stats.OldestFetch, now.Add(-2*time.Hour))
-	}
-	if stats.NewestFetch == nil || !stats.NewestFetch.Equal(now) {
-		t.Errorf("NewestFetch = %v, want %v", stats.NewestFetch, now)
 	}
 }
 

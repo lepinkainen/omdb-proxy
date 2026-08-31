@@ -46,10 +46,9 @@ type Stats struct {
 	PermanentRows int
 	ExpiringRows  int
 	FoundRows     int        // body said Response:"True"
-	NotFoundRows  int        // body said Response:"False"
+	NotFoundRows  int        // body said Response:"False"; derived as TotalRows - FoundRows
 	ExpiredRows   int        // has an expires_at that is already in the past, as of the Stats call's now
 	OldestFetch   *time.Time // nil when the cache is empty
-	NewestFetch   *time.Time
 }
 
 // Summary is one row of the index page's recent-entries table. It
@@ -168,12 +167,9 @@ func (s *Store) Get(ctx context.Context, cacheKey string) (*Entry, error) {
 	}
 	e.FetchedAt = t
 
-	if expiresAt.Valid {
-		et, err := time.Parse(time.RFC3339, expiresAt.String)
-		if err != nil {
-			return nil, errors.Wrap(err, "parse expires_at")
-		}
-		e.ExpiresAt = &et
+	e.ExpiresAt, err = parseNullTime(expiresAt)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse expires_at")
 	}
 
 	return &e, nil
@@ -369,41 +365,44 @@ func (s *Store) Stats(ctx context.Context, now time.Time) (Stats, error) {
 			COUNT(*),
 			SUM(CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END),
 			SUM(CASE WHEN found != 0 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN found = 0 THEN 1 ELSE 0 END),
 			SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END),
-			MIN(fetched_at),
-			MAX(fetched_at)
+			MIN(fetched_at)
 		FROM responses
 	`, nowStr)
 
 	var stats Stats
-	var permanent, found, notFound, expired sql.NullInt64
-	var oldest, newest sql.NullString
-	if err := row.Scan(&stats.TotalRows, &permanent, &found, &notFound, &expired, &oldest, &newest); err != nil {
+	var permanent, found, expired sql.NullInt64
+	var oldest sql.NullString
+	if err := row.Scan(&stats.TotalRows, &permanent, &found, &expired, &oldest); err != nil {
 		return Stats{}, errors.Wrap(err, "read cache stats")
 	}
 	stats.PermanentRows = int(permanent.Int64)
 	stats.ExpiringRows = stats.TotalRows - stats.PermanentRows
 	stats.FoundRows = int(found.Int64)
-	stats.NotFoundRows = int(notFound.Int64)
+	stats.NotFoundRows = stats.TotalRows - stats.FoundRows
 	stats.ExpiredRows = int(expired.Int64)
 
-	if oldest.Valid {
-		t, err := time.Parse(time.RFC3339, oldest.String)
-		if err != nil {
-			return Stats{}, errors.Wrap(err, "parse oldest fetched_at")
-		}
-		stats.OldestFetch = &t
-	}
-	if newest.Valid {
-		t, err := time.Parse(time.RFC3339, newest.String)
-		if err != nil {
-			return Stats{}, errors.Wrap(err, "parse newest fetched_at")
-		}
-		stats.NewestFetch = &t
+	var err error
+	stats.OldestFetch, err = parseNullTime(oldest)
+	if err != nil {
+		return Stats{}, errors.Wrap(err, "parse oldest fetched_at")
 	}
 
 	return stats, nil
+}
+
+// parseNullTime parses an RFC3339 timestamp read from a nullable column,
+// returning (nil, nil) when the column was NULL. It centralises the
+// "optional stored timestamp" shape shared by Get, Stats, and Recent.
+func parseNullTime(s sql.NullString) (*time.Time, error) {
+	if !s.Valid {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, s.String)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // Recent lists the most recently fetched entries, newest first, for the
@@ -437,12 +436,9 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Summary, error) {
 		}
 		sum.FetchedAt = t
 
-		if expiresAt.Valid {
-			et, err := time.Parse(time.RFC3339, expiresAt.String)
-			if err != nil {
-				return nil, errors.Wrap(err, "parse expires_at")
-			}
-			sum.ExpiresAt = &et
+		sum.ExpiresAt, err = parseNullTime(expiresAt)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse expires_at")
 		}
 
 		out = append(out, sum)
