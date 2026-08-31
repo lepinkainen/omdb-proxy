@@ -56,7 +56,9 @@ func formatExpiry(exp *time.Time, now time.Time) string {
 // formatDuration renders a countdown as "12h04m". The dashboard's whole
 // job here is to answer "when does this clear?" without the reader
 // doing timezone arithmetic against their own clock, which is exactly
-// the mistake a bare "resets at midnight UTC" invites.
+// the mistake a bare "resets at midnight UTC" invites — doubly so now
+// that the reset is not a clock time at all, but an epoch anchored to
+// whenever OMDb last rolled over.
 func formatDuration(d time.Duration) string {
 	if d < 0 {
 		d = 0
@@ -84,6 +86,7 @@ type indexPageData struct {
 	QuotaBreakerArmed bool
 	QuotaExhaustedAt  *time.Time
 	QuotaNextProbeAt  *time.Time
+	QuotaEpochStarted time.Time
 	QuotaResetsAt     time.Time
 	QuotaResetsIn     string
 
@@ -152,6 +155,7 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.
 		QuotaBreakerArmed: quota.BreakerArmed,
 		QuotaExhaustedAt:  quota.ExhaustedAt,
 		QuotaNextProbeAt:  quota.NextProbeAt,
+		QuotaEpochStarted: quota.EpochStartedAt,
 		QuotaResetsAt:     quota.ResetsAt,
 		QuotaResetsIn:     formatDuration(quota.ResetsAt.Sub(now)),
 

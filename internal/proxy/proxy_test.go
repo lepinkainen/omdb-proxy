@@ -905,7 +905,7 @@ func TestBreakerProbesAndRecoversWithinTheDay(t *testing.T) {
 	// zero (bar the probe itself) and the breaker is closed, so the
 	// proxy serves the rest of the day instead of idling until UTC
 	// midnight.
-	quota, err := store.Quota(t.Context(), "2026-08-30")
+	quota, err := store.Quota(t.Context(), *clock.Load())
 	if err != nil {
 		t.Fatalf("store.Quota: %v", err)
 	}
@@ -968,7 +968,7 @@ func TestFailedProbeRearmsBreaker(t *testing.T) {
 		t.Errorf("upstream calls = %d, want 2 (a failed probe must re-arm the breaker)", got)
 	}
 
-	quota, err := store.Quota(t.Context(), "2026-08-30")
+	quota, err := store.Quota(t.Context(), *clock.Load())
 	if err != nil {
 		t.Fatalf("store.Quota: %v", err)
 	}
@@ -995,8 +995,13 @@ func TestStatsDistinguishesUpstreamRefusalFromSpentBudget(t *testing.T) {
 	if before["quota_exhausted_upstream"] != false {
 		t.Errorf("quota_exhausted_upstream = %v before any upstream refusal, want false", before["quota_exhausted_upstream"])
 	}
-	if before["quota_resets_at"] != "2026-08-31T00:00:00Z" {
-		t.Errorf("quota_resets_at = %v, want the next UTC midnight", before["quota_resets_at"])
+	// The epoch starts with the first request, not at midnight: nothing
+	// has been spent yet, so it is anchored to the test's clock.
+	if before["quota_epoch_started_at"] != "2026-08-30T12:00:00Z" {
+		t.Errorf("quota_epoch_started_at = %v, want the current instant on an unspent ledger", before["quota_epoch_started_at"])
+	}
+	if before["quota_resets_at"] != "2026-08-31T12:00:00Z" {
+		t.Errorf("quota_resets_at = %v, want one epoch on from the epoch start", before["quota_resets_at"])
 	}
 
 	doRequest(t, h, "i=tt0137523&apikey=client-key")
@@ -1011,8 +1016,8 @@ func TestStatsDistinguishesUpstreamRefusalFromSpentBudget(t *testing.T) {
 	}
 	// The real spend is one request, not the whole budget: the breaker
 	// no longer forges the counter to trip itself.
-	if after["quota_used_today"] != float64(1) {
-		t.Errorf("quota_used_today = %v, want 1 (only the probe itself was spent)", after["quota_used_today"])
+	if after["quota_used"] != float64(1) {
+		t.Errorf("quota_used = %v, want 1 (only the probe itself was spent)", after["quota_used"])
 	}
 	if after["quota_next_probe_at"] != "2026-08-30T12:15:00Z" {
 		t.Errorf("quota_next_probe_at = %v, want an interval after the refusal", after["quota_next_probe_at"])
@@ -1092,7 +1097,7 @@ func TestInconclusiveProbeKeepsBreakerArmed(t *testing.T) {
 				t.Fatalf("upstream calls = %d, want 2 (the probe itself)", got)
 			}
 
-			quota, err := store.Quota(t.Context(), "2026-08-30")
+			quota, err := store.Quota(t.Context(), *clock.Load())
 			if err != nil {
 				t.Fatalf("store.Quota: %v", err)
 			}
@@ -1154,7 +1159,7 @@ func TestProbeRecoversOnAnOrdinaryMiss(t *testing.T) {
 	clock.Store(&probeTime)
 	doRequest(t, h, "i=tt9999999&apikey=client-key")
 
-	quota, err := store.Quota(t.Context(), "2026-08-30")
+	quota, err := store.Quota(t.Context(), *clock.Load())
 	if err != nil {
 		t.Fatalf("store.Quota: %v", err)
 	}
@@ -1163,5 +1168,92 @@ func TestProbeRecoversOnAnOrdinaryMiss(t *testing.T) {
 	}
 	if quota.Used != 1 {
 		t.Errorf("Used = %d, want 1 (fresh budget, minus the probe)", quota.Used)
+	}
+}
+
+// TestBudgetSurvivesUTCMidnightAfterRecovery is the end-to-end form of
+// the accounting bug: with the counter keyed by UTC date, an epoch that
+// began at OMDb's own 06:00 rollover would be handed a second full
+// budget at our midnight — inside one upstream quota day — and spend it
+// straight into a real refusal.
+func TestBudgetSurvivesUTCMidnightAfterRecovery(t *testing.T) {
+	var (
+		calls     int32
+		exhausted atomic.Bool
+	)
+	exhausted.Store(true)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if exhausted.Load() {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, quotaJSON)
+			return
+		}
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	const budget = 3
+	start := time.Date(2026, 8, 30, 0, 5, 0, 0, time.UTC)
+	clock := &atomic.Pointer[time.Time]{}
+	clock.Store(&start)
+
+	h, store := newTestHandlerWithClock(t, upstream.URL, budget, clock, 15*time.Minute)
+
+	// A miss just after our midnight lands in OMDb's previous day and
+	// arms the breaker.
+	doRequest(t, h, "i=tt0000001&apikey=client-key")
+
+	// OMDb rolls over at 06:00; the next probe finds it and starts the
+	// epoch there.
+	exhausted.Store(false)
+	rollover := time.Date(2026, 8, 30, 6, 0, 0, 0, time.UTC)
+	clock.Store(&rollover)
+	doRequest(t, h, "i=tt0000002&apikey=client-key")
+
+	quota, err := store.Quota(t.Context(), rollover)
+	if err != nil {
+		t.Fatalf("store.Quota: %v", err)
+	}
+	if !quota.EpochStartedAt.Equal(rollover) {
+		t.Fatalf("EpochStartedAt = %v, want the observed rollover %v", quota.EpochStartedAt, rollover)
+	}
+
+	// Spend the rest of the budget during the day.
+	afternoon := rollover.Add(8 * time.Hour)
+	clock.Store(&afternoon)
+	doRequest(t, h, "i=tt0000003&apikey=client-key")
+	doRequest(t, h, "i=tt0000004&apikey=client-key")
+
+	spent := atomic.LoadInt32(&calls)
+	if spent != int32(budget+1) {
+		t.Fatalf("upstream calls = %d, want %d (the doomed first miss plus the budget)", spent, budget+1)
+	}
+
+	// Cross UTC midnight. OMDb's day has not rolled — the next one is
+	// due at 06:00 — so nothing more may be spent.
+	pastMidnight := time.Date(2026, 8, 31, 0, 30, 0, 0, time.UTC)
+	clock.Store(&pastMidnight)
+	for i := 5; i < 9; i++ {
+		rec := doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("post-midnight request status = %d, want 401 (budget still spent)", rec.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != spent {
+		t.Errorf("upstream calls = %d, want %d: UTC midnight must not hand out a second budget", got, spent)
+	}
+
+	// One epoch on from the observed rollover, the budget starts over
+	// at that same hour.
+	nextDay := rollover.Add(24 * time.Hour).Add(time.Minute)
+	clock.Store(&nextDay)
+	if rec := doRequest(t, h, "i=tt0000009&apikey=client-key"); rec.Code != http.StatusOK {
+		t.Errorf("next-epoch request status = %d, want 200", rec.Code)
+	}
+	if got := atomic.LoadInt32(&calls); got != spent+1 {
+		t.Errorf("upstream calls = %d, want %d (the new epoch spends again)", got, spent+1)
 	}
 }

@@ -57,7 +57,9 @@ type Config struct {
 	// APIKey is the proxy's own OMDb key, substituted for whatever
 	// apikey (if any) the client sent.
 	APIKey string
-	// DailyBudget caps upstream requests per UTC day.
+	// DailyBudget caps upstream requests per quota epoch — one
+	// upstream quota day, anchored to the last rollover the proxy
+	// observed rather than to the calendar. See cache.QuotaState.
 	DailyBudget int
 	// ProxyToken, if non-empty, must be presented by clients as either
 	// the apikey query parameter or an Authorization: Bearer header.
@@ -289,8 +291,7 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 		return resolution{body: entry.Body, contentType: entry.ContentType, status: entry.Status, cacheStatus: "HIT"}, nil
 	}
 
-	day := now.UTC().Format("2006-01-02")
-	reservation, err := h.store.TryReserveQuota(ctx, day, h.budget, now, h.probeInterval)
+	reservation, err := h.store.TryReserveQuota(ctx, h.budget, now, h.probeInterval)
 	if err != nil {
 		return resolution{}, errors.Wrap(err, "reserve quota")
 	}
@@ -326,14 +327,13 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 		// the response we're about to serve, so it is logged rather
 		// than returned — worst case, some other request records the
 		// exhaustion for us before the day is out.
-		if err := h.store.MarkExhausted(ctx, day, now); err != nil {
+		if err := h.store.MarkExhausted(ctx, now); err != nil {
 			h.logger.Error("record upstream quota exhaustion", "error", err.Error())
 		}
 		// The one event that explains an idle proxy holding a working
 		// key, and the only place it is observable: log it loudly
 		// enough to grep for.
 		h.logger.Warn("upstream quota exhausted",
-			"day", day,
 			"used", reservation.Used,
 			"budget", h.budget,
 			"probe", reservation.Probe,
@@ -357,14 +357,13 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 			// an inconclusive answer simply costs one more interval of
 			// waiting rather than a wrong reset.
 			h.logger.Warn("upstream quota probe inconclusive",
-				"day", day,
 				"status", status,
 				"next_probe_after", h.probeInterval.String(),
 			)
-		} else if err := h.store.MarkRecovered(ctx, day); err != nil {
+		} else if err := h.store.MarkRecovered(ctx, now); err != nil {
 			h.logger.Error("record upstream quota recovery", "error", err.Error())
 		} else {
-			h.logger.Info("upstream quota recovered", "day", day, "budget", h.budget)
+			h.logger.Info("upstream quota recovered", "epoch_started_at", now.UTC().Format(time.RFC3339), "budget", h.budget)
 		}
 	}
 
@@ -536,14 +535,17 @@ type quotaView struct {
 	ExhaustedAt  *time.Time
 	NextProbeAt  *time.Time
 
-	// ResetsAt is the next UTC midnight, when the day key changes and
-	// the counter starts from zero again. A successful probe can beat
-	// it: see cache.MarkRecovered.
+	// EpochStartedAt is when the current accounting epoch began — the
+	// last observed upstream rollover, not a calendar boundary.
+	EpochStartedAt time.Time
+	// ResetsAt is when the counter starts over absent a probe observing
+	// an upstream rollover first. A successful probe beats it: see
+	// cache.MarkRecovered.
 	ResetsAt time.Time
 }
 
 func (h *Handler) quotaView(ctx context.Context, now time.Time) (quotaView, error) {
-	q, err := h.store.Quota(ctx, now.UTC().Format("2006-01-02"))
+	q, err := h.store.Quota(ctx, now)
 	if err != nil {
 		return quotaView{}, err
 	}
@@ -554,12 +556,13 @@ func (h *Handler) quotaView(ctx context.Context, now time.Time) (quotaView, erro
 	}
 
 	v := quotaView{
-		Used:         q.Used,
-		Budget:       h.budget,
-		Remaining:    remaining,
-		BreakerArmed: q.ExhaustedAt != nil,
-		ExhaustedAt:  q.ExhaustedAt,
-		ResetsAt:     now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour),
+		Used:           q.Used,
+		Budget:         h.budget,
+		Remaining:      remaining,
+		BreakerArmed:   q.ExhaustedAt != nil,
+		ExhaustedAt:    q.ExhaustedAt,
+		EpochStartedAt: q.EpochStartedAt,
+		ResetsAt:       q.ResetsAt(),
 	}
 	if q.ExhaustedAt != nil {
 		next := q.ExhaustedAt.Add(h.probeInterval)
@@ -574,7 +577,7 @@ func (h *Handler) quotaView(ctx context.Context, now time.Time) (quotaView, erro
 
 // statsResponse is the JSON shape returned by GET /stats.
 type statsResponse struct {
-	QuotaUsedToday int `json:"quota_used_today"`
+	QuotaUsed      int `json:"quota_used"`
 	QuotaBudget    int `json:"quota_budget"`
 	QuotaRemaining int `json:"quota_remaining"`
 	// QuotaExhaustedUpstream reports the circuit breaker, not the
@@ -582,13 +585,18 @@ type statsResponse struct {
 	QuotaExhaustedUpstream bool   `json:"quota_exhausted_upstream"`
 	QuotaExhaustedAt       string `json:"quota_exhausted_at,omitempty"`
 	QuotaNextProbeAt       string `json:"quota_next_probe_at,omitempty"`
-	QuotaResetsAt          string `json:"quota_resets_at"`
-	TotalCachedRows        int    `json:"total_cached_rows"`
-	PermanentRows          int    `json:"permanent_rows"`
-	ExpiringRows           int    `json:"expiring_rows"`
-	CacheHits              int64  `json:"cache_hits"`
-	CacheMisses            int64  `json:"cache_misses"`
-	CacheStaleServes       int64  `json:"cache_stale_serves"`
+	// QuotaEpochStartedAt is when the current accounting epoch began.
+	// The counter is spend since then, not spend since UTC midnight:
+	// OMDb's day does not start at midnight and it publishes no reset
+	// time, so the epoch tracks the last observed upstream rollover.
+	QuotaEpochStartedAt string `json:"quota_epoch_started_at"`
+	QuotaResetsAt       string `json:"quota_resets_at"`
+	TotalCachedRows     int    `json:"total_cached_rows"`
+	PermanentRows       int    `json:"permanent_rows"`
+	ExpiringRows        int    `json:"expiring_rows"`
+	CacheHits           int64  `json:"cache_hits"`
+	CacheMisses         int64  `json:"cache_misses"`
+	CacheStaleServes    int64  `json:"cache_stale_serves"`
 }
 
 // rfc3339Ptr renders an optional timestamp for the /stats JSON, leaving
@@ -621,13 +629,14 @@ func (h *Handler) StatsHandler(w http.ResponseWriter, r *http.Request) {
 	stats := h.Stats()
 
 	resp := statsResponse{
-		QuotaUsedToday:         quota.Used,
+		QuotaUsed:              quota.Used,
 		QuotaBudget:            quota.Budget,
 		QuotaRemaining:         quota.Remaining,
 		QuotaExhaustedUpstream: quota.BreakerArmed,
 		QuotaExhaustedAt:       rfc3339Ptr(quota.ExhaustedAt),
 		QuotaNextProbeAt:       rfc3339Ptr(quota.NextProbeAt),
-		QuotaResetsAt:          quota.ResetsAt.Format(time.RFC3339),
+		QuotaEpochStartedAt:    quota.EpochStartedAt.UTC().Format(time.RFC3339),
+		QuotaResetsAt:          quota.ResetsAt.UTC().Format(time.RFC3339),
 		TotalCachedRows:        cacheStats.TotalRows,
 		PermanentRows:          cacheStats.PermanentRows,
 		ExpiringRows:           cacheStats.ExpiringRows,

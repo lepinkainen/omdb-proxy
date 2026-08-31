@@ -146,7 +146,7 @@
       {{else if .QuotaExhausted}}
       <div class="note">Local budget spent &mdash; upstream has not refused anything. The proxy stops here to stay under OMDb's own limit, serving stale/cached data or OMDb's quota error until the day rolls over.</div>
       {{end}}
-      <div class="note">Day is UTC: resets in {{.QuotaResetsIn}}, at {{utcTime .QuotaResetsAt}}.</div>
+      <div class="note">Budget period began {{utcTime .QuotaEpochStarted}} &mdash; resets in {{.QuotaResetsIn}}, at {{utcTime .QuotaResetsAt}}, or sooner if a probe finds OMDb&#39;s own day has rolled over. The period tracks OMDb&#39;s quota day, which does not start at UTC midnight and has no documented reset time.</div>
     </div>
 
     <div class="card">

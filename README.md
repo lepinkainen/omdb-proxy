@@ -73,8 +73,8 @@ All configuration is environment variables; there is no config file.
 | `OMDB_API_KEY` | *(required)* | The proxy's own upstream key. The process refuses to start without it. Never logged, never echoed in a response. |
 | `ADDR` | `:8090` | Listen address. |
 | `DB_PATH` | `/data/cache.db` | SQLite database path. |
-| `DAILY_BUDGET` | `900` | Upstream requests allowed per day. Deliberately below OMDb's real 1000, to leave headroom for a second run the same day. |
-| `QUOTA_PROBE_INTERVAL` | `15m` | How long to wait between probes when OMDb says the key is spent. A probe that succeeds means OMDb's day has rolled over, so the budget starts fresh immediately rather than at UTC midnight. |
+| `DAILY_BUDGET` | `900` | Upstream requests allowed per quota day. Deliberately below OMDb's real 1000, to leave headroom for a second run the same day. The day is OMDb's, not the calendar's: it starts at the last rollover the proxy observed. |
+| `QUOTA_PROBE_INTERVAL` | `15m` | How long to wait between probes when OMDb says the key is spent. A probe that succeeds means OMDb's day has rolled over, so the budget starts fresh from that moment rather than at UTC midnight. |
 | `UPSTREAM_URL` | `https://www.omdbapi.com` | Overridable so tests and staging can point elsewhere. |
 | `PROXY_TOKEN` | *(unset)* | If set, clients must present it as `apikey` or `Authorization: Bearer <token>`. **Left unset, this is an open proxy** — fine on a trusted LAN, not something to expose to the internet. |
 | `NOTFOUND_TTL` | `168h` | Go duration string. TTL for `Response:"False"` misses. |
