@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -42,6 +43,34 @@ func newTestHandler(t *testing.T, upstreamURL string, budget int) (*proxy.Handle
 		DailyBudget: budget,
 		HTTPClient:  &http.Client{Timeout: 2 * time.Second},
 		Now:         func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	return h, store
+}
+
+// newTestHandlerWithClock is newTestHandler with a caller-controlled
+// clock and probe interval, for the breaker tests: they need to cross
+// an interval boundary, and sleeping through a real one would make the
+// suite unusable.
+func newTestHandlerWithClock(t *testing.T, upstreamURL string, budget int, now *atomic.Pointer[time.Time], probeInterval time.Duration) (*proxy.Handler, *cache.Store) {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	store, err := cache.Open(dbPath)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	h, err := proxy.New(store, proxy.Config{
+		UpstreamURL:        upstreamURL,
+		APIKey:             proxyAPIKey,
+		DailyBudget:        budget,
+		HTTPClient:         &http.Client{Timeout: 2 * time.Second},
+		QuotaProbeInterval: probeInterval,
+		Now:                func() time.Time { return *now.Load() },
 	})
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
@@ -800,5 +829,205 @@ func TestIndexGuardPathAndQueryEdges(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("non-root path made %d upstream calls in total, want 1", got)
+	}
+}
+
+// TestBreakerProbesAndRecoversWithinTheDay is the regression test for a
+// day lost to nothing at all. OMDb documents neither a quota endpoint
+// nor a reset time, and its day plainly does not start at UTC midnight:
+// a miss just after ours would hit a key that upstream still considered
+// spent, arm the breaker, and — when the breaker only cleared at the
+// next UTC midnight — forfeit the following 24 hours even though the
+// key started working again hours earlier.
+//
+// The upstream here reproduces exactly that: exhausted, then fine.
+func TestBreakerProbesAndRecoversWithinTheDay(t *testing.T) {
+	var (
+		calls     int32
+		exhausted atomic.Bool
+	)
+	exhausted.Store(true)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if exhausted.Load() {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, quotaJSON)
+			return
+		}
+		fmt.Fprint(w, foundMovieJSON("1999"))
+	}))
+	defer upstream.Close()
+
+	const probeInterval = 15 * time.Minute
+	start := time.Date(2026, 8, 30, 0, 5, 0, 0, time.UTC)
+	clock := &atomic.Pointer[time.Time]{}
+	clock.Store(&start)
+
+	h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
+
+	// The miss just after our midnight lands in OMDb's previous day.
+	if rec := doRequest(t, h, "i=tt0137523&apikey=client-key"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("first request status = %d, want 401", rec.Code)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+
+	// Everything inside the probe interval is refused locally.
+	within := start.Add(probeInterval - time.Minute)
+	clock.Store(&within)
+	if rec := doRequest(t, h, "i=tt9999999&apikey=client-key"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("in-interval request status = %d, want 401", rec.Code)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (the breaker must absorb misses between probes)", got)
+	}
+
+	// OMDb rolls into its own new day, hours before ours.
+	exhausted.Store(false)
+	after := start.Add(probeInterval)
+	clock.Store(&after)
+
+	rec := doRequest(t, h, "i=tt0137523&apikey=client-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("probe request status = %d, want 200 once upstream recovered", rec.Code)
+	}
+	if rec.Body.String() != foundMovieJSON("1999") {
+		t.Errorf("probe body = %q, want the movie", rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (exactly one probe)", got)
+	}
+
+	// The recovered probe restarts the budget: the counter is back to
+	// zero (bar the probe itself) and the breaker is closed, so the
+	// proxy serves the rest of the day instead of idling until UTC
+	// midnight.
+	quota, err := store.Quota(t.Context(), "2026-08-30")
+	if err != nil {
+		t.Fatalf("store.Quota: %v", err)
+	}
+	if quota.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil after a successful probe", quota.ExhaustedAt)
+	}
+	if quota.Used != 1 {
+		t.Errorf("Used = %d, want 1: a successful probe starts a fresh upstream day and counts itself", quota.Used)
+	}
+
+	// A different query now reaches upstream immediately, with no wait
+	// for another interval.
+	if rec := doRequest(t, h, "i=tt0111161&apikey=client-key"); rec.Code != http.StatusOK {
+		t.Errorf("post-recovery request status = %d, want 200", rec.Code)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("upstream calls = %d, want 3 (traffic resumes normally after recovery)", got)
+	}
+}
+
+// TestFailedProbeRearmsBreaker: a probe that still comes back exhausted
+// must cost exactly one call and buy another full interval of quiet,
+// otherwise every subsequent miss would ride through the open breaker.
+func TestFailedProbeRearmsBreaker(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, quotaJSON)
+	}))
+	defer upstream.Close()
+
+	const probeInterval = 15 * time.Minute
+	start := time.Date(2026, 8, 30, 3, 0, 0, 0, time.UTC)
+	clock := &atomic.Pointer[time.Time]{}
+	clock.Store(&start)
+
+	h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
+
+	doRequest(t, h, "i=tt0137523&apikey=client-key")
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+
+	probeTime := start.Add(probeInterval)
+	clock.Store(&probeTime)
+	doRequest(t, h, "i=tt9999999&apikey=client-key")
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (one probe)", got)
+	}
+
+	// Immediately afterwards the breaker is armed again.
+	justAfter := probeTime.Add(time.Minute)
+	clock.Store(&justAfter)
+	for i := 0; i < 5; i++ {
+		doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (a failed probe must re-arm the breaker)", got)
+	}
+
+	quota, err := store.Quota(t.Context(), "2026-08-30")
+	if err != nil {
+		t.Fatalf("store.Quota: %v", err)
+	}
+	if quota.ExhaustedAt == nil || !quota.ExhaustedAt.Equal(probeTime) {
+		t.Errorf("ExhaustedAt = %v, want %v (the probe re-arms from its own moment)", quota.ExhaustedAt, probeTime)
+	}
+}
+
+// TestStatsDistinguishesUpstreamRefusalFromSpentBudget covers the
+// reporting half of the fix: zero remaining has two causes that want
+// opposite reactions from an operator, and /stats has to say which.
+func TestStatsDistinguishesUpstreamRefusalFromSpentBudget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, quotaJSON)
+	}))
+	defer upstream.Close()
+
+	h, _ := newTestHandler(t, upstream.URL, 900)
+
+	var before map[string]any
+	decodeStats(t, h, &before)
+	if before["quota_exhausted_upstream"] != false {
+		t.Errorf("quota_exhausted_upstream = %v before any upstream refusal, want false", before["quota_exhausted_upstream"])
+	}
+	if before["quota_resets_at"] != "2026-08-31T00:00:00Z" {
+		t.Errorf("quota_resets_at = %v, want the next UTC midnight", before["quota_resets_at"])
+	}
+
+	doRequest(t, h, "i=tt0137523&apikey=client-key")
+
+	var after map[string]any
+	decodeStats(t, h, &after)
+	if after["quota_exhausted_upstream"] != true {
+		t.Errorf("quota_exhausted_upstream = %v after a quota error, want true", after["quota_exhausted_upstream"])
+	}
+	if after["quota_remaining"] != float64(0) {
+		t.Errorf("quota_remaining = %v, want 0 while the breaker is armed", after["quota_remaining"])
+	}
+	// The real spend is one request, not the whole budget: the breaker
+	// no longer forges the counter to trip itself.
+	if after["quota_used_today"] != float64(1) {
+		t.Errorf("quota_used_today = %v, want 1 (only the probe itself was spent)", after["quota_used_today"])
+	}
+	if after["quota_next_probe_at"] != "2026-08-30T12:15:00Z" {
+		t.Errorf("quota_next_probe_at = %v, want an interval after the refusal", after["quota_next_probe_at"])
+	}
+}
+
+func decodeStats(t *testing.T, h *proxy.Handler, into any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	rec := httptest.NewRecorder()
+	h.StatsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/stats status = %d, want 200", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), into); err != nil {
+		t.Fatalf("decode /stats: %v", err)
 	}
 }

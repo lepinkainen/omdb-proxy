@@ -81,8 +81,9 @@ CREATE TABLE IF NOT EXISTS responses (
 );
 
 CREATE TABLE IF NOT EXISTS quota (
-    day  TEXT PRIMARY KEY,
-    used INTEGER NOT NULL
+    day          TEXT PRIMARY KEY,
+    used         INTEGER NOT NULL,
+    exhausted_at TEXT
 );
 `
 
@@ -111,8 +112,44 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, errors.Wrap(err, "create schema")
 	}
+	if err := migrateQuotaExhaustedAt(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return &Store{db: db}, nil
+}
+
+// migrateQuotaExhaustedAt adds the quota.exhausted_at column to a
+// database created before the circuit breaker was separated from the
+// used counter. CREATE TABLE IF NOT EXISTS leaves a pre-existing table
+// alone, so a deployment upgrading in place would otherwise keep the
+// two-column table and fail every quota read. SQLite has no
+// ADD COLUMN IF NOT EXISTS, hence the pragma check.
+func migrateQuotaExhaustedAt(db *sql.DB) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('quota')`)
+	if err != nil {
+		return errors.Wrap(err, "inspect quota columns")
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return errors.Wrap(err, "scan quota column name")
+		}
+		if name == "exhausted_at" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return errors.Wrap(err, "iterate quota columns")
+	}
+
+	if _, err := db.Exec(`ALTER TABLE quota ADD COLUMN exhausted_at TEXT`); err != nil {
+		return errors.Wrap(err, "add quota.exhausted_at column")
+	}
+	return nil
 }
 
 // Close releases the underlying database handle.
@@ -186,92 +223,205 @@ func (s *Store) Put(ctx context.Context, e Entry) error {
 	return nil
 }
 
-// TryReserveQuota attempts to spend one unit of the given day's budget.
-// It reports whether the reservation succeeded (used < budget before the
-// call) and the number of requests used for that day afterwards.
+// Reservation is the outcome of a TryReserveQuota call.
+type Reservation struct {
+	// Granted reports whether the caller may spend an upstream request.
+	Granted bool
+	// Used is the day's counter after the call.
+	Used int
+	// Probe is true when this reservation was granted as the single
+	// half-open probe past an armed breaker. The caller must report
+	// what upstream said: MarkRecovered on a normal response,
+	// MarkExhausted on another quota error. Nothing else re-closes the
+	// breaker, so a dropped probe result leaves the proxy refusing
+	// until the next interval lapses.
+	Probe bool
+}
+
+// QuotaDay is the ledger state for one accounting day.
+type QuotaDay struct {
+	// Used counts upstream requests actually spent. Unlike the
+	// pre-breaker design, nothing ever forces this to the budget: it is
+	// a real measurement, which is what makes "did we spend it or did
+	// upstream cut us off?" answerable after the fact.
+	Used int
+	// ExhaustedAt is when the breaker was last armed or probed, or nil
+	// when it is closed.
+	ExhaustedAt *time.Time
+}
+
+// TryReserveQuota attempts to spend one unit of the given day's budget,
+// subject to both the local budget and the upstream circuit breaker.
 //
-// The check-then-increment happens inside a single transaction. Combined
-// with the store's single-connection pool, this makes the whole
-// operation atomic across concurrent callers: only one goroutine can
-// hold the connection at a time, so no two callers can both observe
-// used < budget and both increment past it.
-func (s *Store) TryReserveQuota(ctx context.Context, day string, budget int) (reserved bool, used int, err error) {
+// It refuses when the day's counter has reached budget, or when the
+// breaker was armed (or last probed) less than probeInterval ago. Once
+// that interval lapses, exactly one caller is granted a probe: the
+// grant pushes exhausted_at forward to now, so every other caller
+// arriving in the same interval is still refused. That is what keeps a
+// burst of cache misses from turning into a burst of doomed upstream
+// calls the moment the breaker becomes probeable.
+//
+// A probe deliberately ignores the budget check. The breaker is only
+// ever armed by upstream telling us the key is spent, and a probe that
+// succeeds resets the counter to zero anyway (see MarkRecovered), so
+// the worst case is one request past the local cap — and the local cap
+// exists to stay under OMDb's limit, which upstream has already told us
+// we are at.
+//
+// The check-then-increment happens inside a single transaction.
+// Combined with the store's single-connection pool, this makes the
+// whole operation atomic across concurrent callers: only one goroutine
+// can hold the connection at a time, so no two callers can both observe
+// used < budget and both increment past it, and no two can both take
+// the same probe.
+func (s *Store) TryReserveQuota(ctx context.Context, day string, budget int, now time.Time, probeInterval time.Duration) (Reservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, 0, errors.Wrap(err, "begin quota transaction")
+		return Reservation{}, errors.Wrap(err, "begin quota transaction")
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	row := tx.QueryRowContext(ctx, `SELECT used FROM quota WHERE day = ?`, day)
-	if err := row.Scan(&used); err != nil {
+	var (
+		used        int
+		exhaustedAt sql.NullString
+	)
+	row := tx.QueryRowContext(ctx, `SELECT used, exhausted_at FROM quota WHERE day = ?`, day)
+	if err := row.Scan(&used, &exhaustedAt); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			return false, 0, errors.Wrap(err, "read quota")
+			return Reservation{}, errors.Wrap(err, "read quota")
 		}
 		used = 0
 	}
 
-	if used >= budget {
-		return false, used, nil
+	probe := false
+	if exhaustedAt.Valid {
+		armedAt, err := time.Parse(time.RFC3339, exhaustedAt.String)
+		if err != nil {
+			return Reservation{}, errors.Wrap(err, "parse exhausted_at")
+		}
+		if now.Sub(armedAt) < probeInterval {
+			return Reservation{Used: used}, nil
+		}
+		probe = true
 	}
 
-	if _, err := tx.ExecContext(ctx, `
+	if !probe && used >= budget {
+		return Reservation{Used: used}, nil
+	}
+
+	if probe {
+		// Claim the probe by moving the breaker's timer to now, in the
+		// same transaction that spends the request.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE quota SET used = used + 1, exhausted_at = ? WHERE day = ?
+		`, now.UTC().Format(time.RFC3339), day); err != nil {
+			return Reservation{}, errors.Wrap(err, "claim quota probe")
+		}
+	} else if _, err := tx.ExecContext(ctx, `
 		INSERT INTO quota (day, used) VALUES (?, 1)
 		ON CONFLICT(day) DO UPDATE SET used = used + 1
 	`, day); err != nil {
-		return false, 0, errors.Wrap(err, "increment quota")
+		return Reservation{}, errors.Wrap(err, "increment quota")
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, 0, errors.Wrap(err, "commit quota transaction")
+		return Reservation{}, errors.Wrap(err, "commit quota transaction")
 	}
 
-	return true, used + 1, nil
+	return Reservation{Granted: true, Used: used + 1, Probe: probe}, nil
 }
 
-// MarkExhausted trips the local circuit breaker for the rest of day: it
-// forces the day's used counter up to at least budget, so every later
-// TryReserveQuota call for that day is refused before it ever reaches
-// upstream.
+// MarkExhausted arms the upstream circuit breaker for day: it records
+// that upstream reported the key spent as of now, which makes
+// TryReserveQuota refuse until a probe interval has passed.
 //
 // The local counter is only ever a *prediction* of OMDb's own quota —
 // it can disagree with reality if the cache DB was recreated, the
-// budget was raised, or something else spent requests against the
-// same upstream key. An upstream response that decodes as a quota
-// error is ground truth that the prediction was wrong, and the caller
-// is expected to invoke this the moment it sees one, so the rest of
-// the day's cache misses stop paying for upstream calls that are
-// already known to fail. This matters most in combination with stale
-// serving: when a stale cache entry exists, the caller hands the
-// consumer a perfectly good STALE response and the consumer never
-// sees the quota error itself, so nothing else in the system would
-// otherwise learn that the key is exhausted for the day.
+// budget was raised, or something else spent requests against the same
+// upstream key. An upstream response that decodes as a quota error is
+// ground truth that the prediction was wrong, and the caller is
+// expected to invoke this the moment it sees one, so the rest of the
+// day's cache misses stop paying for upstream calls that are already
+// known to fail. This matters most in combination with stale serving:
+// when a stale cache entry exists, the caller hands the consumer a
+// perfectly good STALE response and the consumer never sees the quota
+// error itself, so nothing else in the system would otherwise learn
+// that the key is exhausted.
 //
-// The upsert only ever raises the counter (MAX), never lowers it, so
-// a concurrent caller that has already pushed used past budget is not
-// clobbered back down by a slightly stale MarkExhausted call.
-func (s *Store) MarkExhausted(ctx context.Context, day string, budget int) error {
+// It deliberately leaves used alone. An earlier design tripped the
+// breaker by forcing used up to the budget, which worked but destroyed
+// the evidence: a forfeited day and a genuinely spent one produced
+// byte-identical rows, so neither /stats nor the dashboard could say
+// which had happened.
+//
+// The timestamp only ever moves forward (MAX), so a slightly stale
+// caller cannot wind the breaker back and hand out an early probe.
+// RFC3339 in UTC is fixed-width, so lexical MAX is chronological MAX.
+func (s *Store) MarkExhausted(ctx context.Context, day string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO quota (day, used) VALUES (?, ?)
-		ON CONFLICT(day) DO UPDATE SET used = MAX(used, excluded.used)
-	`, day, budget)
+		INSERT INTO quota (day, used, exhausted_at) VALUES (?, 0, ?)
+		ON CONFLICT(day) DO UPDATE SET exhausted_at = MAX(COALESCE(exhausted_at, ''), excluded.exhausted_at)
+	`, day, now.UTC().Format(time.RFC3339))
 	if err != nil {
 		return errors.Wrap(err, "mark quota exhausted")
 	}
 	return nil
 }
 
-// QuotaUsed returns the number of upstream requests already spent on the
-// given day, for reporting via /stats.
-func (s *Store) QuotaUsed(ctx context.Context, day string) (int, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT used FROM quota WHERE day = ?`, day)
-	var used int
-	if err := row.Scan(&used); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, nil
-		}
-		return 0, errors.Wrap(err, "read quota")
+// MarkRecovered closes the breaker for day and resets the day's counter
+// to zero. The caller invokes it when a probe comes back as an ordinary
+// response rather than a quota error.
+//
+// Resetting used is the point, not a side effect. OMDb publishes no
+// endpoint for remaining quota and no documented reset time, so the
+// only observable boundary of an upstream quota day is the moment a
+// previously refused key starts answering again. Treating that as the
+// start of a fresh budget is what stops the proxy's UTC-midnight
+// accounting from drifting against OMDb's own, which is precisely the
+// failure this replaced: a quota error just after UTC midnight used to
+// forfeit the entire following day.
+//
+// This assumes the proxy is the only spender of its key. If something
+// else shares it, the reset is optimistic and the proxy will simply
+// rediscover exhaustion on a later probe.
+//
+// The counter restarts at 1, not 0: the probe that discovered the
+// recovery was itself served out of the new upstream day, so OMDb has
+// already counted it. Erring towards over-counting is the safe
+// direction — the budget exists to stay under a limit we cannot read.
+func (s *Store) MarkRecovered(ctx context.Context, day string) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE quota SET used = 1, exhausted_at = NULL WHERE day = ?
+	`, day); err != nil {
+		return errors.Wrap(err, "mark quota recovered")
 	}
-	return used, nil
+	return nil
+}
+
+// Quota returns the ledger state for the given day, for reporting via
+// /stats and the index page. A day with no row is not an error: it is
+// simply a day on which nothing has been spent yet.
+func (s *Store) Quota(ctx context.Context, day string) (QuotaDay, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT used, exhausted_at FROM quota WHERE day = ?`, day)
+
+	var (
+		q           QuotaDay
+		exhaustedAt sql.NullString
+	)
+	if err := row.Scan(&q.Used, &exhaustedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return QuotaDay{}, nil
+		}
+		return QuotaDay{}, errors.Wrap(err, "read quota")
+	}
+	if exhaustedAt.Valid {
+		t, err := time.Parse(time.RFC3339, exhaustedAt.String)
+		if err != nil {
+			return QuotaDay{}, errors.Wrap(err, "parse exhausted_at")
+		}
+		q.ExhaustedAt = &t
+	}
+	return q, nil
 }
 
 // Stats reports cache-wide counts for the /stats admin endpoint and the

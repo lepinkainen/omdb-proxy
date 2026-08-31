@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"embed"
+	"fmt"
 	"html/template"
 	"net/http"
 	"time"
@@ -52,6 +53,18 @@ func formatExpiry(exp *time.Time, now time.Time) string {
 	return formatUTC(*exp)
 }
 
+// formatDuration renders a countdown as "12h04m". The dashboard's whole
+// job here is to answer "when does this clear?" without the reader
+// doing timezone arithmetic against their own clock, which is exactly
+// the mistake a bare "resets at midnight UTC" invites.
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Minute)
+	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
 // indexPageData is everything index.html needs to render. It is built
 // fresh on every request from live store reads plus the in-memory
 // counters — the index page is a dashboard, not something worth caching
@@ -63,6 +76,16 @@ type indexPageData struct {
 	QuotaBudget    int
 	QuotaRemaining int
 	QuotaExhausted bool
+
+	// QuotaBreakerArmed separates "OMDb refused us" from "we spent our
+	// own budget". Both show zero remaining and want different
+	// reactions from whoever is reading the page, and conflating them
+	// is what made a forfeited day look like a busy one.
+	QuotaBreakerArmed bool
+	QuotaExhaustedAt  *time.Time
+	QuotaNextProbeAt  *time.Time
+	QuotaResetsAt     time.Time
+	QuotaResetsIn     string
 
 	Stats  cache.Stats
 	Recent []cache.Summary
@@ -85,21 +108,16 @@ type indexPageData struct {
 func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.Time) {
 	ctx := r.Context()
 	now := h.now()
-	day := now.UTC().Format("2006-01-02")
 
 	// The quota read mirrors StatsHandler's: if we can't even tell the
 	// operator how much budget is left, the page isn't worth serving
 	// half-broken, so this one failure is fatal like it is in /stats.
-	used, err := h.store.QuotaUsed(ctx, day)
+	quota, err := h.quotaView(ctx, now)
 	if err != nil {
 		h.logger.Error("index: read quota", "error", err.Error())
 		h.logRequest("", "INDEX", http.StatusInternalServerError, start)
 		http.Error(w, "omdb-proxy: failed to read quota", http.StatusInternalServerError)
 		return
-	}
-	remaining := h.budget - used
-	if remaining < 0 {
-		remaining = 0
 	}
 
 	// Everything below is best-effort: a failure to read cache-wide
@@ -126,10 +144,16 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.
 	data := indexPageData{
 		Now: now,
 
-		QuotaUsedToday: used,
-		QuotaBudget:    h.budget,
-		QuotaRemaining: remaining,
-		QuotaExhausted: remaining == 0,
+		QuotaUsedToday: quota.Used,
+		QuotaBudget:    quota.Budget,
+		QuotaRemaining: quota.Remaining,
+		QuotaExhausted: quota.Remaining == 0,
+
+		QuotaBreakerArmed: quota.BreakerArmed,
+		QuotaExhaustedAt:  quota.ExhaustedAt,
+		QuotaNextProbeAt:  quota.NextProbeAt,
+		QuotaResetsAt:     quota.ResetsAt,
+		QuotaResetsIn:     formatDuration(quota.ResetsAt.Sub(now)),
 
 		Stats:  cacheStats,
 		Recent: recent,

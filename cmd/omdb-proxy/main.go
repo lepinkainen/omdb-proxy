@@ -47,12 +47,13 @@ func run(logger *slog.Logger) error {
 	defer store.Close()
 
 	handler, err := proxy.New(store, proxy.Config{
-		UpstreamURL: cfg.upstreamURL,
-		APIKey:      cfg.apiKey,
-		DailyBudget: cfg.dailyBudget,
-		ProxyToken:  cfg.proxyToken,
-		NotFoundTTL: cfg.notFoundTTL,
-		Logger:      logger,
+		UpstreamURL:        cfg.upstreamURL,
+		APIKey:             cfg.apiKey,
+		DailyBudget:        cfg.dailyBudget,
+		ProxyToken:         cfg.proxyToken,
+		NotFoundTTL:        cfg.notFoundTTL,
+		QuotaProbeInterval: cfg.probeInterval,
+		Logger:             logger,
 	})
 	if err != nil {
 		return errors.Wrap(err, "construct proxy handler")
@@ -104,6 +105,9 @@ type config struct {
 	upstreamURL string
 	proxyToken  string
 	notFoundTTL time.Duration
+	// probeInterval is how long the upstream circuit breaker waits
+	// between probes; see proxy.DefaultQuotaProbeInterval.
+	probeInterval time.Duration
 }
 
 // loadConfig reads environment variables, applying defaults. OMDB_API_KEY
@@ -127,14 +131,20 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 
+	probeInterval, err := envDuration("QUOTA_PROBE_INTERVAL", proxy.DefaultQuotaProbeInterval)
+	if err != nil {
+		return config{}, err
+	}
+
 	return config{
-		apiKey:      apiKey,
-		addr:        envOr("ADDR", ":8090"),
-		dbPath:      envOr("DB_PATH", "/data/cache.db"),
-		dailyBudget: budget,
-		upstreamURL: envOr("UPSTREAM_URL", "https://www.omdbapi.com"),
-		proxyToken:  os.Getenv("PROXY_TOKEN"),
-		notFoundTTL: notFoundTTL,
+		apiKey:        apiKey,
+		addr:          envOr("ADDR", ":8090"),
+		dbPath:        envOr("DB_PATH", "/data/cache.db"),
+		dailyBudget:   budget,
+		upstreamURL:   envOr("UPSTREAM_URL", "https://www.omdbapi.com"),
+		proxyToken:    os.Getenv("PROXY_TOKEN"),
+		notFoundTTL:   notFoundTTL,
+		probeInterval: probeInterval,
 	}, nil
 }
 

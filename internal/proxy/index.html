@@ -140,11 +140,13 @@
     <div class="card">
       <h2>Quota</h2>
       <div class="big {{if .QuotaExhausted}}exhausted{{else}}ok{{end}}">{{.QuotaRemaining}}</div>
-      <div>remaining today &mdash; {{.QuotaUsedToday}} / {{.QuotaBudget}} used</div>
-      {{if .QuotaExhausted}}
-      <div class="note">Budget exhausted for today. The circuit breaker is tripped: the proxy will serve stale/cached data or OMDb's own quota error rather than calling upstream again until the day resets.</div>
+      <div>remaining &mdash; {{.QuotaUsedToday}} / {{.QuotaBudget}} used</div>
+      {{if .QuotaBreakerArmed}}
+      <div class="note"><strong>OMDb refused the key</strong> at {{utcTimePtr .QuotaExhaustedAt}} &mdash; this is upstream's limit, not the local budget. The proxy is serving stale/cached data or OMDb's own quota error rather than spending calls it knows will fail. Next probe at {{utcTimePtr .QuotaNextProbeAt}}: if OMDb answers normally then, its day has rolled over and the full budget starts again immediately, without waiting for UTC midnight.</div>
+      {{else if .QuotaExhausted}}
+      <div class="note">Local budget spent &mdash; upstream has not refused anything. The proxy stops here to stay under OMDb's own limit, serving stale/cached data or OMDb's quota error until the day rolls over.</div>
       {{end}}
-      <div class="note">Day is UTC; resets at midnight UTC.</div>
+      <div class="note">Day is UTC: resets in {{.QuotaResetsIn}}, at {{utcTime .QuotaResetsAt}}.</div>
     </div>
 
     <div class="card">
