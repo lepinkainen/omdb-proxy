@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"embed"
-	"fmt"
 	"html/template"
 	"net/http"
 	"time"
@@ -53,20 +52,6 @@ func formatExpiry(exp *time.Time, now time.Time) string {
 	return formatUTC(*exp)
 }
 
-// formatDuration renders a countdown as "12h04m". The dashboard's whole
-// job here is to answer "when does this clear?" without the reader
-// doing timezone arithmetic against their own clock, which is exactly
-// the mistake a bare "resets at midnight UTC" invites — doubly so now
-// that the reset is not a clock time at all, but an epoch anchored to
-// whenever OMDb last rolled over.
-func formatDuration(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	d = d.Round(time.Minute)
-	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
-}
-
 // indexPageData is everything index.html needs to render. It is built
 // fresh on every request from live store reads plus the in-memory
 // counters — the index page is a dashboard, not something worth caching
@@ -74,21 +59,17 @@ func formatDuration(d time.Duration) string {
 type indexPageData struct {
 	Now time.Time
 
-	QuotaUsedToday int
-	QuotaBudget    int
-	QuotaRemaining int
-	QuotaExhausted bool
+	// QuotaUsed is spend since QuotaCountingSince, not "today": OMDb's
+	// quota day does not start at UTC midnight and it publishes no
+	// reset time, so the page shows the real boundary it knows.
+	QuotaUsed          int
+	QuotaCountingSince time.Time
 
-	// QuotaBreakerArmed separates "OMDb refused us" from "we spent our
-	// own budget". Both show zero remaining and want different
-	// reactions from whoever is reading the page, and conflating them
-	// is what made a forfeited day look like a busy one.
-	QuotaBreakerArmed bool
-	QuotaExhaustedAt  *time.Time
-	QuotaNextProbeAt  *time.Time
-	QuotaEpochStarted time.Time
-	QuotaResetsAt     time.Time
-	QuotaResetsIn     string
+	// QuotaExhausted reports what OMDb last told us. It gates nothing —
+	// the next cache miss tries upstream either way — so the page says
+	// "refusing" rather than implying the proxy has stopped.
+	QuotaExhausted   bool
+	QuotaExhaustedAt *time.Time
 
 	Stats  cache.Stats
 	Recent []cache.Summary
@@ -147,17 +128,11 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request, start time.
 	data := indexPageData{
 		Now: now,
 
-		QuotaUsedToday: quota.Used,
-		QuotaBudget:    quota.Budget,
-		QuotaRemaining: quota.Remaining,
-		QuotaExhausted: quota.Remaining == 0,
+		QuotaUsed:          quota.Used,
+		QuotaCountingSince: quota.CountingSince,
 
-		QuotaBreakerArmed: quota.BreakerArmed,
-		QuotaExhaustedAt:  quota.ExhaustedAt,
-		QuotaNextProbeAt:  quota.NextProbeAt,
-		QuotaEpochStarted: quota.EpochStartedAt,
-		QuotaResetsAt:     quota.ResetsAt,
-		QuotaResetsIn:     formatDuration(quota.ResetsAt.Sub(now)),
+		QuotaExhausted:   quota.ExhaustedAt != nil,
+		QuotaExhaustedAt: quota.ExhaustedAt,
 
 		Stats:  cacheStats,
 		Recent: recent,

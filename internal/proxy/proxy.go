@@ -22,32 +22,12 @@ import (
 	"github.com/lepinkainen/omdb-proxy/internal/cache"
 )
 
-// quotaBody is OMDb's own response shape for an exhausted key, byte for
-// byte. Trap #5: when our budget is spent and there's no stale entry to
-// fall back to, we hand this back verbatim (not a proxy-specific error),
-// because every consumer of this proxy already knows how to recognise
-// and abort cleanly on it.
-const quotaBody = `{"Response":"False","Error":"Request limit reached!"}`
-
-const quotaContentType = "application/json"
-
 // invalidKeyBody mirrors OMDb's shape for a rejected key, used only for
 // the optional PROXY_TOKEN gate — never sent upstream, never confused
 // with a real quota response.
 const invalidKeyBody = `{"Response":"False","Error":"Invalid API key!"}`
 
-// DefaultQuotaProbeInterval is how long the proxy waits between probes
-// while upstream says the key is spent.
-//
-// OMDb documents neither a way to query remaining quota nor when its
-// day rolls over, so the only way to learn that the key works again is
-// to spend a request finding out. The interval trades recovery latency
-// against doomed calls: at 15 minutes the proxy resumes within a
-// quarter hour of OMDb's reset, whenever that turns out to be, for at
-// most ~96 refused calls across a fully exhausted day. Probes are
-// refused upstream rather than served, so they cost latency and
-// politeness rather than quota.
-const DefaultQuotaProbeInterval = 15 * time.Minute
+const jsonContentType = "application/json"
 
 // Config configures a Handler. See the field comments for the
 // environment variables each one maps to in cmd/omdb-proxy.
@@ -57,10 +37,6 @@ type Config struct {
 	// APIKey is the proxy's own OMDb key, substituted for whatever
 	// apikey (if any) the client sent.
 	APIKey string
-	// DailyBudget caps upstream requests per quota epoch — one
-	// upstream quota day, anchored to the last rollover the proxy
-	// observed rather than to the calendar. See cache.QuotaState.
-	DailyBudget int
 	// ProxyToken, if non-empty, must be presented by clients as either
 	// the apikey query parameter or an Authorization: Bearer header.
 	// Left empty, the proxy accepts any (or no) client key.
@@ -71,11 +47,6 @@ type Config struct {
 	// Now returns the current time. Defaults to time.Now; overridden in
 	// tests so expiry decisions can be pinned to a fixed clock.
 	Now func() time.Time
-	// QuotaProbeInterval is how long the upstream circuit breaker stays
-	// closed to traffic before letting a single probe through to test
-	// whether OMDb has rolled into a new quota day. Defaults to
-	// DefaultQuotaProbeInterval when zero.
-	QuotaProbeInterval time.Duration
 	// NotFoundTTL is the expiry applied to Response:"False" misses.
 	// Defaults to DefaultNotFoundTTL (see its doc comment for why this
 	// is finite rather than permanent) when zero.
@@ -99,16 +70,14 @@ type Stats struct {
 
 // Handler serves the OMDb-compatible endpoint plus the admin endpoints.
 type Handler struct {
-	store         *cache.Store
-	upstreamURL   string
-	apiKey        string
-	budget        int
-	probeInterval time.Duration
-	proxyToken    string
-	httpClient    *http.Client
-	now           func() time.Time
-	notFoundTTL   time.Duration
-	logger        *slog.Logger
+	store       *cache.Store
+	upstreamURL string
+	apiKey      string
+	proxyToken  string
+	httpClient  *http.Client
+	now         func() time.Time
+	notFoundTTL time.Duration
+	logger      *slog.Logger
 
 	group singleflight.Group
 
@@ -136,26 +105,20 @@ func New(store *cache.Store, cfg Config) (*Handler, error) {
 	if notFoundTTL == 0 {
 		notFoundTTL = DefaultNotFoundTTL
 	}
-	probeInterval := cfg.QuotaProbeInterval
-	if probeInterval == 0 {
-		probeInterval = DefaultQuotaProbeInterval
-	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
 
 	return &Handler{
-		store:         store,
-		upstreamURL:   strings.TrimRight(cfg.UpstreamURL, "/"),
-		apiKey:        cfg.APIKey,
-		budget:        cfg.DailyBudget,
-		probeInterval: probeInterval,
-		proxyToken:    cfg.ProxyToken,
-		httpClient:    httpClient,
-		now:           now,
-		notFoundTTL:   notFoundTTL,
-		logger:        logger,
+		store:       store,
+		upstreamURL: strings.TrimRight(cfg.UpstreamURL, "/"),
+		apiKey:      cfg.APIKey,
+		proxyToken:  cfg.ProxyToken,
+		httpClient:  httpClient,
+		now:         now,
+		notFoundTTL: notFoundTTL,
+		logger:      logger,
 	}, nil
 }
 
@@ -206,7 +169,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !h.authorised(r) {
 		h.logger.Warn("request rejected", "reason", "bad proxy token", "remote_addr", r.RemoteAddr)
-		writeBody(w, http.StatusUnauthorized, quotaContentType, []byte(invalidKeyBody), "")
+		writeBody(w, http.StatusUnauthorized, jsonContentType, []byte(invalidKeyBody), "")
 		return
 	}
 
@@ -291,14 +254,14 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 		return resolution{body: entry.Body, contentType: entry.ContentType, status: entry.Status, cacheStatus: "HIT"}, nil
 	}
 
-	reservation, err := h.store.TryReserveQuota(ctx, h.budget, now, h.probeInterval)
-	if err != nil {
-		return resolution{}, errors.Wrap(err, "reserve quota")
-	}
-	if !reservation.Granted {
-		return h.budgetExhausted(entry)
-	}
-
+	// Every cache miss tries upstream. There is no local budget and no
+	// minimum gap between attempts: OMDb publishes no way to read
+	// remaining quota and no reset time, so a request that upstream
+	// actually answers is the only evidence a new quota day has begun,
+	// and refusing to make that request is what would keep the proxy
+	// idle while its key worked. A run of misses against an exhausted
+	// key therefore makes a run of doomed calls, deliberately — they
+	// cost latency, not quota, because upstream is already refusing.
 	body, contentType, status, upstreamErr := h.fetchUpstream(ctx, canonical)
 	if upstreamErr != nil {
 		// Upstream is down or timed out. Trap #4: consumers must never
@@ -309,61 +272,40 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 
 	found, quotaError, year, yearOK := parseEnvelope(body, contentType)
 	if quotaError {
-		// Trap #2: this is a property of our key's daily allowance,
-		// not of the movie. Never let it land in the cache table,
-		// where it would look like a permanent fact about this query.
-
-		// Trip the local circuit breaker before anything else. Our own
-		// budget counter is a prediction of OMDb's counter; a decoded
-		// quota error is ground truth that the prediction was wrong,
-		// and treating it as ground truth *now* is what stops every
-		// remaining cache miss today from spending its own doomed
-		// upstream call to rediscover the same fact. This is most
-		// important exactly here, in combination with staleOrQuota
-		// below: when a stale entry exists, the caller is about to get
-		// a perfectly good STALE response and will never see this
-		// quota error itself, so this is the only place left that can
-		// record it. A failure to persist the marker doesn't change
-		// the response we're about to serve, so it is logged rather
-		// than returned — worst case, some other request records the
-		// exhaustion for us before the day is out.
+		// Trap #2: this is a property of our key's allowance, not of
+		// the movie. Never let it land in the cache table, where it
+		// would look like a permanent fact about this query.
+		//
+		// Recording it changes nothing about what the next miss does —
+		// it will try upstream too. What it buys is the memory that
+		// makes the next *served* response meaningful: that is what
+		// tells us OMDb rolled into a new day. It matters most in
+		// combination with staleOrQuota below: when a stale entry
+		// exists the consumer gets a perfectly good STALE response and
+		// never sees the quota error, so this is the only place left
+		// that can record it.
 		if err := h.store.MarkExhausted(ctx, now); err != nil {
 			h.logger.Error("record upstream quota exhaustion", "error", err.Error())
 		}
-		// The one event that explains an idle proxy holding a working
-		// key, and the only place it is observable: log it loudly
-		// enough to grep for.
-		h.logger.Warn("upstream quota exhausted",
-			"used", reservation.Used,
-			"budget", h.budget,
-			"probe", reservation.Probe,
-			"next_probe_after", h.probeInterval.String(),
-		)
+		// The one event that explains an idle-looking proxy, and the
+		// only place it is observable: log it loudly enough to grep.
+		h.logger.Warn("upstream quota exhausted", "query", canonical)
 
 		return h.staleOrQuota(entry, body, contentType, status)
 	}
 
-	if reservation.Probe {
-		// This request went upstream only because the breaker was due a
-		// probe. Closing the breaker hands the proxy a fresh budget, so
-		// the bar for it is proof that OMDb served us — an ordinary
-		// answer, hit or miss, with a 200. "Not a quota error" is not
-		// that proof: a 502 HTML page from a CDN and an "Invalid API
-		// key!" both clear that bar while telling us nothing about the
-		// quota day, and believing either would resume full-rate
-		// traffic into a key that is still refused.
-		if status != http.StatusOK || !recognisedEnvelope(body, contentType) {
-			// The probe already pushed the breaker's timer forward, so
-			// an inconclusive answer simply costs one more interval of
-			// waiting rather than a wrong reset.
-			h.logger.Warn("upstream quota probe inconclusive",
-				"status", status,
-				"next_probe_after", h.probeInterval.String(),
-			)
-		} else if err := h.store.MarkRecovered(ctx, now); err != nil {
-			h.logger.Error("record upstream quota recovery", "error", err.Error())
-		} else {
-			h.logger.Info("upstream quota recovered", "epoch_started_at", now.UTC().Format(time.RFC3339), "budget", h.budget)
+	if status == http.StatusOK && recognisedEnvelope(body, contentType) {
+		// OMDb answered. If it had been refusing us, this proves its
+		// quota day has rolled over, and RecordServed restarts the
+		// counter from here; otherwise it is an ordinary increment.
+		//
+		// The bar is proof that OMDb served us, not merely the absence
+		// of a quota error: a 502 HTML page from a CDN and an "Invalid
+		// API key!" both clear that weaker bar while saying nothing
+		// about the quota day. An ordinary "Movie not found!" does
+		// qualify — it is a served answer.
+		if err := h.store.RecordServed(ctx, now); err != nil {
+			h.logger.Error("record served upstream request", "error", err.Error())
 		}
 	}
 
@@ -388,17 +330,6 @@ func (h *Handler) resolve(ctx context.Context, cacheKey, canonical string, isSea
 	}
 
 	return resolution{body: body, contentType: contentType, status: status, cacheStatus: "MISS"}, nil
-}
-
-// budgetExhausted handles the case where our own daily budget check
-// failed before we even tried upstream: serve the stale entry if one
-// exists (trap #4), otherwise hand back OMDb's own quota body verbatim
-// (trap #5) without spending an upstream call to get it.
-func (h *Handler) budgetExhausted(entry *cache.Entry) (resolution, error) {
-	if entry != nil {
-		return resolution{body: entry.Body, contentType: entry.ContentType, status: entry.Status, cacheStatus: "STALE"}, nil
-	}
-	return resolution{body: []byte(quotaBody), contentType: quotaContentType, status: http.StatusUnauthorized, cacheStatus: "MISS"}, nil
 }
 
 // staleOrError handles an upstream transport failure (network error,
@@ -516,32 +447,22 @@ func (h *Handler) Healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // quotaView is the quota picture shared by /stats and the index page.
-// Both need the same three questions answered — how much is left, why
-// it is zero, and when that changes — and answering them in one place
-// keeps the JSON and the dashboard from drifting apart.
+// Both answer the same two questions — is OMDb serving us, and how much
+// have we spent since it last rolled over — and answering them in one
+// place keeps the JSON and the dashboard from drifting apart.
 type quotaView struct {
-	Used      int
-	Budget    int
-	Remaining int
+	Used int
 
-	// BreakerArmed distinguishes the two ways Remaining reaches zero.
-	// Armed means upstream refused us and the proxy is waiting on a
-	// probe; not armed means the proxy spent its own budget and is
-	// holding the line until the day rolls over. They look identical
-	// from the outside and want completely different responses from an
-	// operator, which is why they are separate fields rather than one
-	// "exhausted" flag.
-	BreakerArmed bool
-	ExhaustedAt  *time.Time
-	NextProbeAt  *time.Time
+	// ExhaustedAt is when upstream last refused the key, or nil when it
+	// is serving normally. It does not gate anything: the next cache
+	// miss tries upstream either way.
+	ExhaustedAt *time.Time
 
-	// EpochStartedAt is when the current accounting epoch began — the
-	// last observed upstream rollover, not a calendar boundary.
-	EpochStartedAt time.Time
-	// ResetsAt is when the counter starts over absent a probe observing
-	// an upstream rollover first. A successful probe beats it: see
-	// cache.MarkRecovered.
-	ResetsAt time.Time
+	// CountingSince is when Used last started from zero — the last
+	// observed upstream rollover, or first use. It is a real timestamp
+	// rather than "today" because OMDb's day does not start at UTC
+	// midnight and has no documented reset time.
+	CountingSince time.Time
 }
 
 func (h *Handler) quotaView(ctx context.Context, now time.Time) (quotaView, error) {
@@ -549,54 +470,28 @@ func (h *Handler) quotaView(ctx context.Context, now time.Time) (quotaView, erro
 	if err != nil {
 		return quotaView{}, err
 	}
-
-	remaining := h.budget - q.Used
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	v := quotaView{
-		Used:           q.Used,
-		Budget:         h.budget,
-		Remaining:      remaining,
-		BreakerArmed:   q.ExhaustedAt != nil,
-		ExhaustedAt:    q.ExhaustedAt,
-		EpochStartedAt: q.EpochStartedAt,
-		ResetsAt:       q.ResetsAt(),
-	}
-	if q.ExhaustedAt != nil {
-		next := q.ExhaustedAt.Add(h.probeInterval)
-		v.NextProbeAt = &next
-		// An armed breaker refuses upstream calls regardless of what
-		// the counter says, so reporting anything but zero here would
-		// promise capacity the proxy will not spend.
-		v.Remaining = 0
-	}
-	return v, nil
+	return quotaView{
+		Used:          q.Used,
+		ExhaustedAt:   q.ExhaustedAt,
+		CountingSince: q.CountingSince,
+	}, nil
 }
 
 // statsResponse is the JSON shape returned by GET /stats.
 type statsResponse struct {
-	QuotaUsed      int `json:"quota_used"`
-	QuotaBudget    int `json:"quota_budget"`
-	QuotaRemaining int `json:"quota_remaining"`
-	// QuotaExhaustedUpstream reports the circuit breaker, not the
-	// budget: true means OMDb itself refused the key.
+	QuotaUsed int `json:"quota_used"`
+	// QuotaExhaustedUpstream reports what OMDb last told us: true means
+	// it is refusing the key. There is no local budget to exhaust.
 	QuotaExhaustedUpstream bool   `json:"quota_exhausted_upstream"`
 	QuotaExhaustedAt       string `json:"quota_exhausted_at,omitempty"`
-	QuotaNextProbeAt       string `json:"quota_next_probe_at,omitempty"`
-	// QuotaEpochStartedAt is when the current accounting epoch began.
-	// The counter is spend since then, not spend since UTC midnight:
-	// OMDb's day does not start at midnight and it publishes no reset
-	// time, so the epoch tracks the last observed upstream rollover.
-	QuotaEpochStartedAt string `json:"quota_epoch_started_at"`
-	QuotaResetsAt       string `json:"quota_resets_at"`
-	TotalCachedRows     int    `json:"total_cached_rows"`
-	PermanentRows       int    `json:"permanent_rows"`
-	ExpiringRows        int    `json:"expiring_rows"`
-	CacheHits           int64  `json:"cache_hits"`
-	CacheMisses         int64  `json:"cache_misses"`
-	CacheStaleServes    int64  `json:"cache_stale_serves"`
+	// QuotaCountingSince is when quota_used last started from zero.
+	QuotaCountingSince string `json:"quota_counting_since"`
+	TotalCachedRows    int    `json:"total_cached_rows"`
+	PermanentRows      int    `json:"permanent_rows"`
+	ExpiringRows       int    `json:"expiring_rows"`
+	CacheHits          int64  `json:"cache_hits"`
+	CacheMisses        int64  `json:"cache_misses"`
+	CacheStaleServes   int64  `json:"cache_stale_serves"`
 }
 
 // rfc3339Ptr renders an optional timestamp for the /stats JSON, leaving
@@ -630,13 +525,9 @@ func (h *Handler) StatsHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp := statsResponse{
 		QuotaUsed:              quota.Used,
-		QuotaBudget:            quota.Budget,
-		QuotaRemaining:         quota.Remaining,
-		QuotaExhaustedUpstream: quota.BreakerArmed,
+		QuotaExhaustedUpstream: quota.ExhaustedAt != nil,
 		QuotaExhaustedAt:       rfc3339Ptr(quota.ExhaustedAt),
-		QuotaNextProbeAt:       rfc3339Ptr(quota.NextProbeAt),
-		QuotaEpochStartedAt:    quota.EpochStartedAt.UTC().Format(time.RFC3339),
-		QuotaResetsAt:          quota.ResetsAt.UTC().Format(time.RFC3339),
+		QuotaCountingSince:     quota.CountingSince.UTC().Format(time.RFC3339),
 		TotalCachedRows:        cacheStats.TotalRows,
 		PermanentRows:          cacheStats.PermanentRows,
 		ExpiringRows:           cacheStats.ExpiringRows,

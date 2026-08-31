@@ -140,187 +140,17 @@ func TestPermanentEntryHasNilExpiry(t *testing.T) {
 }
 
 // quotaTestClock is an arbitrary fixed instant; quota tests move
-// relative to it rather than to the wall clock so an interval or an
-// epoch can be crossed without sleeping.
+// relative to it rather than to the wall clock.
 var quotaTestClock = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
 
-const testProbeInterval = 15 * time.Minute
-
-func TestTryReserveQuotaEnforcesBudget(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
-	res, err := store.TryReserveQuota(ctx, 2, quotaTestClock, testProbeInterval)
-	if err != nil || !res.Granted || res.Used != 1 {
-		t.Fatalf("1st reservation: %+v err=%v, want granted with used=1", res, err)
-	}
-
-	res, err = store.TryReserveQuota(ctx, 2, quotaTestClock, testProbeInterval)
-	if err != nil || !res.Granted || res.Used != 2 {
-		t.Fatalf("2nd reservation: %+v err=%v, want granted with used=2", res, err)
-	}
-
-	res, err = store.TryReserveQuota(ctx, 2, quotaTestClock, testProbeInterval)
-	if err != nil || res.Granted {
-		t.Fatalf("3rd reservation: %+v err=%v, want refused (budget exhausted)", res, err)
-	}
-	if res.Probe {
-		t.Error("a budget refusal must never be reported as a probe: nothing upstream has refused us")
-	}
-
-	got, err := store.Quota(ctx, quotaTestClock)
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	if got.Used != 2 {
-		t.Errorf("Used = %d, want 2", got.Used)
-	}
-	if got.ExhaustedAt != nil {
-		t.Errorf("ExhaustedAt = %v, want nil: spending the local budget is not an upstream refusal", got.ExhaustedAt)
-	}
-	if !got.EpochStartedAt.Equal(quotaTestClock) {
-		t.Errorf("EpochStartedAt = %v, want %v (the first spend starts the epoch)", got.EpochStartedAt, quotaTestClock)
-	}
-}
-
-// TestUTCMidnightDoesNotResetTheCounter is the regression test for the
-// second half of the quota-accounting bug. The counter used to be keyed
-// by UTC date, which silently assumed OMDb's day starts at UTC midnight.
-// It does not: with a rollover observed at 06:00, crossing our midnight
-// would present an empty row and hand out a second full budget inside a
-// single upstream quota day, walking straight into a real refusal.
-func TestUTCMidnightDoesNotResetTheCounter(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
-	// An upstream rollover observed at 06:00 anchors the epoch there.
-	rollover := time.Date(2026, 8, 30, 6, 0, 0, 0, time.UTC)
-	if err := store.MarkRecovered(ctx, rollover); err != nil {
-		t.Fatalf("MarkRecovered: %v", err)
-	}
-
-	// Spend the rest of the budget during the day.
-	for i := 0; i < 3; i++ {
-		if _, err := store.TryReserveQuota(ctx, 4, rollover.Add(time.Hour), testProbeInterval); err != nil {
-			t.Fatalf("TryReserveQuota: %v", err)
-		}
-	}
-
-	// Cross UTC midnight. OMDb's day has not rolled — the next one is
-	// due at 06:00 — so the counter must not reset.
-	pastMidnight := time.Date(2026, 8, 31, 0, 30, 0, 0, time.UTC)
-	got, err := store.Quota(ctx, pastMidnight)
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	if got.Used != 4 {
-		t.Errorf("Used = %d after UTC midnight, want 4: the calendar is not the accounting boundary", got.Used)
-	}
-	if !got.EpochStartedAt.Equal(rollover) {
-		t.Errorf("EpochStartedAt = %v, want %v (unchanged across UTC midnight)", got.EpochStartedAt, rollover)
-	}
-
-	res, err := store.TryReserveQuota(ctx, 4, pastMidnight, testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if res.Granted {
-		t.Error("granted = true after UTC midnight, want false: that would be a second full budget inside one upstream day")
-	}
-}
-
-// TestEpochRollsForwardPreservingItsHour covers the fallback that keeps
-// a proxy which never exhausts its budget from stopping forever, and
-// the phase it keeps: an epoch anchored to OMDb's observed 06:00
-// rollover must roll again at 06:00, not at whenever traffic resumed.
-func TestEpochRollsForwardPreservingItsHour(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
-	rollover := time.Date(2026, 8, 30, 6, 0, 0, 0, time.UTC)
-	if err := store.MarkRecovered(ctx, rollover); err != nil {
-		t.Fatalf("MarkRecovered: %v", err)
-	}
-
-	justBefore := rollover.Add(24*time.Hour - time.Minute)
-	got, err := store.Quota(ctx, justBefore)
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	if got.Used != 1 || !got.EpochStartedAt.Equal(rollover) {
-		t.Fatalf("Quota just before the epoch ends = %+v, want used=1 and the original epoch", got)
-	}
-
-	// A full epoch on, the counter starts over at the same hour.
-	next := rollover.Add(24 * time.Hour)
-	got, err = store.Quota(ctx, next.Add(time.Minute))
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	if got.Used != 0 {
-		t.Errorf("Used = %d, want 0 once a full epoch has elapsed", got.Used)
-	}
-	if !got.EpochStartedAt.Equal(next) {
-		t.Errorf("EpochStartedAt = %v, want %v", got.EpochStartedAt, next)
-	}
-
-	// Idle for days: the epoch advances in whole steps, so it still
-	// lands on 06:00 rather than re-anchoring to now.
-	muchLater := rollover.Add(72*time.Hour + 3*time.Hour)
-	got, err = store.Quota(ctx, muchLater)
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	want := rollover.Add(72 * time.Hour)
-	if !got.EpochStartedAt.Equal(want) {
-		t.Errorf("EpochStartedAt = %v, want %v (whole-epoch steps preserve the observed hour)", got.EpochStartedAt, want)
-	}
-}
-
-// TestEpochRolloverKeepsTheBreakerArmed: the rollover is our own
-// estimate of when the next upstream day starts, while the breaker
-// records something upstream actually said. Clearing it on the estimate
-// would resume full-rate traffic on a guess.
-func TestEpochRolloverKeepsTheBreakerArmed(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
-	if _, err := store.TryReserveQuota(ctx, 900, quotaTestClock, testProbeInterval); err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
-	}
-
-	afterEpoch := quotaTestClock.Add(25 * time.Hour)
-	got, err := store.Quota(ctx, afterEpoch)
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	if got.Used != 0 {
-		t.Errorf("Used = %d, want 0 after the epoch rolled", got.Used)
-	}
-	if got.ExhaustedAt == nil {
-		t.Error("breaker cleared by the epoch rollover, want it left armed for a probe to settle")
-	}
-}
-
-// TestMarkExhaustedArmsBreakerWithoutTouchingUsed pins the split that
-// makes a forfeited period diagnosable. The old design tripped the
-// breaker by forcing used up to the budget, which left a period the
-// proxy never got to use looking byte-identical to one it spent.
-func TestMarkExhaustedArmsBreakerWithoutTouchingUsed(t *testing.T) {
+func TestRecordServedCountsUpstreamRequests(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		if _, err := store.TryReserveQuota(ctx, 900, quotaTestClock, testProbeInterval); err != nil {
-			t.Fatalf("TryReserveQuota: %v", err)
+		if err := store.RecordServed(ctx, quotaTestClock); err != nil {
+			t.Fatalf("RecordServed: %v", err)
 		}
-	}
-
-	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
 	}
 
 	got, err := store.Quota(ctx, quotaTestClock)
@@ -328,150 +158,82 @@ func TestMarkExhaustedArmsBreakerWithoutTouchingUsed(t *testing.T) {
 		t.Fatalf("Quota: %v", err)
 	}
 	if got.Used != 3 {
-		t.Errorf("Used = %d, want 3: MarkExhausted must record what upstream said, not rewrite what we spent", got.Used)
+		t.Errorf("Used = %d, want 3", got.Used)
 	}
-	if got.ExhaustedAt == nil || !got.ExhaustedAt.Equal(quotaTestClock) {
-		t.Fatalf("ExhaustedAt = %v, want %v", got.ExhaustedAt, quotaTestClock)
+	if got.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil", got.ExhaustedAt)
 	}
-
-	// Refused immediately afterwards despite 897 of the budget being
-	// nominally free: upstream's word beats the local prediction.
-	res, err := store.TryReserveQuota(ctx, 900, quotaTestClock.Add(time.Minute), testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if res.Granted {
-		t.Error("granted = true, want false while the breaker is freshly armed")
+	if !got.CountingSince.Equal(quotaTestClock) {
+		t.Errorf("CountingSince = %v, want %v (the first request starts the count)", got.CountingSince, quotaTestClock)
 	}
 }
 
-// TestBreakerGrantsOneProbePerInterval is the core of the recovery
-// path: once the interval lapses exactly one caller gets through, and
-// the grant re-arms the timer so a burst of misses cannot become a
-// burst of doomed upstream calls.
-func TestBreakerGrantsOneProbePerInterval(t *testing.T) {
+// TestRecordServedAfterExhaustionRestartsTheCount is the whole recovery
+// rule. OMDb exposes no way to read remaining quota and documents no
+// reset time, so a request it actually answers, after refusing us, is
+// the only evidence its day has rolled over.
+func TestRecordServedAfterExhaustionRestartsTheCount(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
-	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
-	}
-
-	justBefore := quotaTestClock.Add(testProbeInterval - time.Second)
-	res, err := store.TryReserveQuota(ctx, 900, justBefore, testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if res.Granted {
-		t.Fatal("granted = true one second before the interval lapsed, want false")
-	}
-
-	lapsed := quotaTestClock.Add(testProbeInterval)
-	res, err = store.TryReserveQuota(ctx, 900, lapsed, testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if !res.Granted || !res.Probe {
-		t.Fatalf("reservation = %+v, want a granted probe once the interval lapsed", res)
-	}
-
-	// The second caller in the same instant must be refused: the probe
-	// is a single request, not an open door.
-	res, err = store.TryReserveQuota(ctx, 900, lapsed, testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if res.Granted {
-		t.Error("granted = true for a second caller in the same interval, want false (only one probe at a time)")
-	}
-
-	// ...and the next probe is due an interval after the probe, not
-	// after the original arming.
-	res, err = store.TryReserveQuota(ctx, 900, lapsed.Add(testProbeInterval), testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if !res.Granted || !res.Probe {
-		t.Errorf("reservation = %+v, want a second probe one interval after the first", res)
-	}
-}
-
-// TestProbeIgnoresSpentBudget covers the deliberate one-request
-// overshoot: a probe is about detecting OMDb's day boundary, and
-// refusing it because the local counter is full would leave the proxy
-// unable to ever discover that the boundary had passed.
-func TestProbeIgnoresSpentBudget(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
-	if _, err := store.TryReserveQuota(ctx, 1, quotaTestClock, testProbeInterval); err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
-		t.Fatalf("MarkExhausted: %v", err)
-	}
-
-	res, err := store.TryReserveQuota(ctx, 1, quotaTestClock.Add(testProbeInterval), testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
-	}
-	if !res.Granted || !res.Probe {
-		t.Fatalf("reservation = %+v, want a granted probe even with the budget spent", res)
-	}
-}
-
-// TestMarkRecoveredStartsANewEpoch pins the behaviour that keeps the
-// proxy's accounting aligned to OMDb's day: a probe that comes back
-// normal is the only observable start of an upstream quota day, so it
-// becomes the epoch.
-func TestMarkRecoveredStartsANewEpoch(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
-	for i := 0; i < 4; i++ {
-		if _, err := store.TryReserveQuota(ctx, 900, quotaTestClock, testProbeInterval); err != nil {
-			t.Fatalf("TryReserveQuota: %v", err)
+	for i := 0; i < 5; i++ {
+		if err := store.RecordServed(ctx, quotaTestClock); err != nil {
+			t.Fatalf("RecordServed: %v", err)
 		}
 	}
-	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
+	if err := store.MarkExhausted(ctx, quotaTestClock.Add(time.Hour)); err != nil {
 		t.Fatalf("MarkExhausted: %v", err)
 	}
 
-	recoveredAt := quotaTestClock.Add(90 * time.Minute)
-	if err := store.MarkRecovered(ctx, recoveredAt); err != nil {
-		t.Fatalf("MarkRecovered: %v", err)
+	// Still five: being refused is not spending.
+	got, err := store.Quota(ctx, quotaTestClock)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.Used != 5 {
+		t.Errorf("Used = %d, want 5: MarkExhausted must record what upstream said, not rewrite what we spent", got.Used)
+	}
+	if got.ExhaustedAt == nil {
+		t.Fatal("ExhaustedAt = nil, want the refusal recorded")
 	}
 
-	got, err := store.Quota(ctx, recoveredAt)
+	// Hours later OMDb answers again: a new quota day.
+	rollover := quotaTestClock.Add(9 * time.Hour)
+	if err := store.RecordServed(ctx, rollover); err != nil {
+		t.Fatalf("RecordServed: %v", err)
+	}
+
+	got, err = store.Quota(ctx, rollover)
 	if err != nil {
 		t.Fatalf("Quota: %v", err)
 	}
 	if got.Used != 1 {
-		t.Errorf("Used = %d, want 1: a recovered probe starts a fresh epoch, having spent one request itself", got.Used)
+		t.Errorf("Used = %d, want 1: the answering request is the first of the new day", got.Used)
 	}
 	if got.ExhaustedAt != nil {
-		t.Errorf("ExhaustedAt = %v, want nil after recovery", got.ExhaustedAt)
+		t.Errorf("ExhaustedAt = %v, want nil once upstream answers again", got.ExhaustedAt)
 	}
-	if !got.EpochStartedAt.Equal(recoveredAt) {
-		t.Errorf("EpochStartedAt = %v, want %v (the recovery is the observed rollover)", got.EpochStartedAt, recoveredAt)
-	}
-	if !got.ResetsAt().Equal(recoveredAt.Add(24 * time.Hour)) {
-		t.Errorf("ResetsAt = %v, want one epoch after the recovery", got.ResetsAt())
+	if !got.CountingSince.Equal(rollover) {
+		t.Errorf("CountingSince = %v, want %v (the observed rollover)", got.CountingSince, rollover)
 	}
 
-	res, err := store.TryReserveQuota(ctx, 900, recoveredAt.Add(time.Minute), testProbeInterval)
-	if err != nil {
-		t.Fatalf("TryReserveQuota: %v", err)
+	// And the next one increments from there rather than restarting.
+	if err := store.RecordServed(ctx, rollover.Add(time.Minute)); err != nil {
+		t.Fatalf("RecordServed: %v", err)
 	}
-	if !res.Granted || res.Probe {
-		t.Errorf("reservation = %+v, want an ordinary grant once the breaker is closed", res)
+	got, err = store.Quota(ctx, rollover)
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	if got.Used != 2 || !got.CountingSince.Equal(rollover) {
+		t.Errorf("Quota = %+v, want used=2 counting from %v", got, rollover)
 	}
 }
 
-// TestMarkExhaustedNeverWindsTheBreakerBack guards the MAX in the
-// upsert: a slightly stale caller must not shorten the wait and hand
-// out an early probe.
-func TestMarkExhaustedNeverWindsTheBreakerBack(t *testing.T) {
+// TestMarkExhaustedNeverWindsTheTimestampBack guards the MAX in the
+// upsert, so a slightly stale caller cannot rewrite when upstream
+// refused us.
+func TestMarkExhaustedNeverWindsTheTimestampBack(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
@@ -483,18 +245,6 @@ func TestMarkExhaustedNeverWindsTheBreakerBack(t *testing.T) {
 	}
 
 	got, err := store.Quota(ctx, quotaTestClock)
-	if err != nil {
-		t.Fatalf("Quota: %v", err)
-	}
-	if got.ExhaustedAt == nil || !got.ExhaustedAt.Equal(quotaTestClock) {
-		t.Errorf("ExhaustedAt = %v, want %v (an older mark must not wind the breaker back)", got.ExhaustedAt, quotaTestClock)
-	}
-
-	// Idempotent: repeating the same mark changes nothing.
-	if err := store.MarkExhausted(ctx, quotaTestClock); err != nil {
-		t.Fatalf("MarkExhausted (repeat): %v", err)
-	}
-	got, err = store.Quota(ctx, quotaTestClock)
 	if err != nil {
 		t.Fatalf("Quota: %v", err)
 	}
@@ -512,17 +262,16 @@ func TestQuotaOnAnEmptyLedgerIsZero(t *testing.T) {
 	if got.Used != 0 || got.ExhaustedAt != nil {
 		t.Errorf("Quota = %+v, want an unspent ledger", got)
 	}
-	if !got.EpochStartedAt.Equal(quotaTestClock) {
-		t.Errorf("EpochStartedAt = %v, want now (%v): the epoch starts with the first request", got.EpochStartedAt, quotaTestClock)
+	if !got.CountingSince.Equal(quotaTestClock) {
+		t.Errorf("CountingSince = %v, want now (%v)", got.CountingSince, quotaTestClock)
 	}
 }
 
 // TestOpenDropsTheLegacyDayKeyedQuotaTable covers upgrading a deployed
 // database. The old rows counted spend within a UTC calendar day, which
-// is not what the epoch ledger measures, and rows written before the
-// breaker was separated from the counter hold a forged used value —
-// carrying either forward would start the proxy on a number it should
-// not trust.
+// this proxy no longer tracks, and rows written by the pre-breaker code
+// hold a forged used value. The drop has to happen before the schema is
+// applied, or a legacy database would be read on the old shape.
 func TestOpenDropsTheLegacyDayKeyedQuotaTable(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 
@@ -540,7 +289,7 @@ func TestOpenDropsTheLegacyDayKeyedQuotaTable(t *testing.T) {
 
 	store, err := Open(dbPath)
 	if err != nil {
-		t.Fatalf("Open on a pre-epoch database: %v", err)
+		t.Fatalf("Open on a pre-simplification database: %v", err)
 	}
 	defer store.Close()
 

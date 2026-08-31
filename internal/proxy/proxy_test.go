@@ -25,7 +25,7 @@ const proxyAPIKey = "proxy-owns-this-key"
 // newTestHandler wires a Handler to a temp-file SQLite cache and a fake
 // upstream, with a fixed clock so expiry assertions don't race the
 // calendar. Nothing here ever talks to the real omdbapi.com.
-func newTestHandler(t *testing.T, upstreamURL string, budget int) (*proxy.Handler, *cache.Store) {
+func newTestHandler(t *testing.T, upstreamURL string) (*proxy.Handler, *cache.Store) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "cache.db")
@@ -40,7 +40,6 @@ func newTestHandler(t *testing.T, upstreamURL string, budget int) (*proxy.Handle
 	h, err := proxy.New(store, proxy.Config{
 		UpstreamURL: upstreamURL,
 		APIKey:      proxyAPIKey,
-		DailyBudget: budget,
 		HTTPClient:  &http.Client{Timeout: 2 * time.Second},
 		Now:         func() time.Time { return fixedNow },
 	})
@@ -54,7 +53,7 @@ func newTestHandler(t *testing.T, upstreamURL string, budget int) (*proxy.Handle
 // clock and probe interval, for the breaker tests: they need to cross
 // an interval boundary, and sleeping through a real one would make the
 // suite unusable.
-func newTestHandlerWithClock(t *testing.T, upstreamURL string, budget int, now *atomic.Pointer[time.Time], probeInterval time.Duration) (*proxy.Handler, *cache.Store) {
+func newTestHandlerWithClock(t *testing.T, upstreamURL string, now *atomic.Pointer[time.Time]) (*proxy.Handler, *cache.Store) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "cache.db")
@@ -65,12 +64,10 @@ func newTestHandlerWithClock(t *testing.T, upstreamURL string, budget int, now *
 	t.Cleanup(func() { store.Close() })
 
 	h, err := proxy.New(store, proxy.Config{
-		UpstreamURL:        upstreamURL,
-		APIKey:             proxyAPIKey,
-		DailyBudget:        budget,
-		HTTPClient:         &http.Client{Timeout: 2 * time.Second},
-		QuotaProbeInterval: probeInterval,
-		Now:                func() time.Time { return *now.Load() },
+		UpstreamURL: upstreamURL,
+		APIKey:      proxyAPIKey,
+		HTTPClient:  &http.Client{Timeout: 2 * time.Second},
+		Now:         func() time.Time { return *now.Load() },
 	})
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
@@ -104,7 +101,7 @@ func TestCacheMissThenHit(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	first := doRequest(t, h, "i=tt0137523&apikey=client-key")
 	if first.Code != http.StatusOK {
@@ -136,7 +133,7 @@ func TestCanonicalizationSharesCacheEntry(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	doRequest(t, h, "i=TT0137523&apikey=a")
 	doRequest(t, h, "apikey=b&i=tt0137523")
@@ -155,7 +152,7 @@ func TestClientAPIKeyNeverForwardedUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 	doRequest(t, h, "i=tt0137523&apikey=some-clients-own-key")
 
 	if receivedKey != proxyAPIKey {
@@ -177,7 +174,7 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, store := newTestHandler(t, upstream.URL, 900)
+	h, store := newTestHandler(t, upstream.URL)
 
 	first := doRequest(t, h, "i=tt0137523&apikey=client-key")
 	if first.Code != http.StatusUnauthorized {
@@ -197,35 +194,53 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 		t.Fatalf("a quota response must never be cached, but found an entry: %+v", entry)
 	}
 
-	// A second request for the same query must not retry upstream: the
-	// first quota error already tripped the local circuit breaker
-	// (MarkExhausted) for the rest of the day, so this is served from
-	// the budget-exhausted path instead of spending another doomed
-	// upstream call. This replaces the old expectation that a retry
-	// would reach upstream again — that unconditional-retry behaviour
-	// is exactly the bug the circuit breaker exists to close; see
-	// TestQuotaErrorTripsBreakerForOtherQueries and
-	// TestQuotaErrorTripsBreakerServesStaleForOtherQuery below for the
-	// breaker's cross-query behaviour.
+	// A second request for the same query tries upstream again, and this
+	// time OMDb answers — which is exactly how the proxy learns the
+	// quota day has rolled over. Nothing was cached to stop it trying.
 	second := doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if second.Code != http.StatusUnauthorized {
-		t.Errorf("second request status = %d, want 401 (breaker tripped, no retry)", second.Code)
+	if second.Code != http.StatusOK {
+		t.Errorf("second request status = %d, want 200", second.Code)
 	}
-	if second.Body.String() != quotaJSON {
-		t.Errorf("second request body = %q, want the quota body", second.Body.String())
+	if second.Body.String() != foundMovieJSON("1999") {
+		t.Errorf("second request body = %q, want the movie", second.Body.String())
 	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("upstream calls = %d, want 1 (the circuit breaker must block the retry)", got)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (the retry is what discovers the reset)", got)
+	}
+
+	// The served answer is cached, unlike the quota error before it.
+	entry, err = store.Get(t.Context(), key)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("the served response was not cached")
+	}
+
+	quota, err := store.Quota(t.Context(), time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("store.Quota: %v", err)
+	}
+	if quota.ExhaustedAt != nil {
+		t.Errorf("ExhaustedAt = %v, want nil once OMDb answered again", quota.ExhaustedAt)
+	}
+	if quota.Used != 1 {
+		t.Errorf("Used = %d, want 1: the answering request is the first of the new quota day", quota.Used)
 	}
 }
 
-// TestQuotaErrorTripsBreakerForOtherQueries is the core regression test for
-// the defect this proxy used to have: a quota error decoded for one movie
-// must stop upstream calls for every other cache miss for the rest of the
-// day too, not just for the query that triggered it. Before MarkExhausted
-// existed, each of these misses would have spent its own doomed upstream
-// call rediscovering the same exhausted key.
-func TestQuotaErrorTripsBreakerForOtherQueries(t *testing.T) {
+// TestEveryMissRetriesWhileUpstreamRefuses is the deliberate inverse of
+// what this test used to assert. An earlier design recorded a quota
+// error and then refused to call upstream again for the rest of the day,
+// which meant the proxy sat idle for hours holding a key that had
+// started working again.
+//
+// OMDb publishes no way to ask how much quota is left and documents no
+// reset time, so a request it actually answers is the only evidence its
+// day has rolled over. Refusing to make that request is refusing to ever
+// find out. The doomed calls in between are the accepted price: upstream
+// is already refusing, so they cost latency, not quota.
+func TestEveryMissRetriesWhileUpstreamRefuses(t *testing.T) {
 	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
@@ -235,35 +250,30 @@ func TestQuotaErrorTripsBreakerForOtherQueries(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
-	first := doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if first.Code != http.StatusUnauthorized {
-		t.Fatalf("first request status = %d, want 401", first.Code)
+	const misses = 5
+	for i := 0; i < misses; i++ {
+		rec := doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("request %d status = %d, want 401", i, rec.Code)
+		}
+		if rec.Body.String() != quotaJSON {
+			t.Errorf("request %d body = %q, want upstream's quota body verbatim", i, rec.Body.String())
+		}
 	}
 
-	// A completely different, uncached query must not reach upstream
-	// either: the first response's quota error tripped the breaker for
-	// the whole day, not just for that one movie.
-	second := doRequest(t, h, "i=tt9999999&apikey=client-key")
-	if second.Code != http.StatusUnauthorized {
-		t.Errorf("second request status = %d, want 401", second.Code)
-	}
-	if second.Body.String() != quotaJSON {
-		t.Errorf("second request body = %q, want the quota body", second.Body.String())
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("upstream calls = %d, want 1 (breaker must stop the second query from trying upstream)", got)
+	if got := atomic.LoadInt32(&calls); got != misses {
+		t.Errorf("upstream calls = %d, want %d (one per cache miss)", got, misses)
 	}
 }
 
-// TestQuotaErrorTripsBreakerServesStaleForOtherQuery covers the scenario
-// the bug report called out specifically: when a stale entry exists for
-// the next query, staleOrQuota hands the consumer a perfectly good STALE
-// response, so the consumer never sees a quota error to react to. Without
-// the breaker, nothing would ever stop the loop of doomed upstream calls
-// hiding behind those STALE responses.
-func TestQuotaErrorTripsBreakerServesStaleForOtherQuery(t *testing.T) {
+// TestQuotaErrorServesStaleForOtherQuery: when a stale entry exists,
+// the consumer gets a perfectly good STALE response rather than an
+// error, and never sees the quota error at all. That is the point of
+// serving stale — a consumer must never break because the proxy's key
+// is spent.
+func TestQuotaErrorServesStaleForOtherQuery(t *testing.T) {
 	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
@@ -273,7 +283,7 @@ func TestQuotaErrorTripsBreakerServesStaleForOtherQuery(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, store := newTestHandler(t, upstream.URL, 900)
+	h, store := newTestHandler(t, upstream.URL)
 
 	// Seed a stale (expired) entry for a second, different query.
 	staleBody := foundMovieJSON("1999")
@@ -305,8 +315,11 @@ func TestQuotaErrorTripsBreakerServesStaleForOtherQuery(t *testing.T) {
 	if second.Body.String() != staleBody {
 		t.Errorf("second request body = %q, want the stale cached body %q", second.Body.String(), staleBody)
 	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("upstream calls = %d, want 1 (breaker must serve the stale entry without a second upstream call)", got)
+	// The second request did try upstream — every miss does — and was
+	// refused again; what matters is that the consumer got the stale
+	// body rather than an error, and never saw the quota response.
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (each miss tries; the stale body is what the consumer sees)", got)
 	}
 }
 
@@ -319,7 +332,7 @@ func TestNotFoundMissIsCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	first := doRequest(t, h, "i=tt9999999&apikey=client-key")
 	if first.Body.String() != notFoundJSON {
@@ -335,35 +348,13 @@ func TestNotFoundMissIsCached(t *testing.T) {
 	}
 }
 
-func TestBudgetExhaustedWithNoCacheReturnsQuotaBodyWithoutCallingUpstream(t *testing.T) {
-	var calls int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		t.Error("upstream must not be called when the daily budget is already exhausted")
-	}))
-	defer upstream.Close()
-
-	h, _ := newTestHandler(t, upstream.URL, 0) // DAILY_BUDGET=0
-
-	resp := doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if resp.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", resp.Code)
-	}
-	if resp.Body.String() != quotaJSON {
-		t.Errorf("body = %q, want OMDb's own quota body %q", resp.Body.String(), quotaJSON)
-	}
-	if got := atomic.LoadInt32(&calls); got != 0 {
-		t.Errorf("upstream calls = %d, want 0", got)
-	}
-}
-
 func TestStaleServedWhenUpstreamFails(t *testing.T) {
 	// A server that is immediately closed makes every request fail
 	// with a connection error — a stand-in for upstream being down.
 	deadUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	deadUpstream.Close()
 
-	h, store := newTestHandler(t, deadUpstream.URL, 900)
+	h, store := newTestHandler(t, deadUpstream.URL)
 
 	staleBody := foundMovieJSON("1999")
 	canonical := "i=tt0137523"
@@ -406,7 +397,7 @@ func TestExpiryPolicyOldMovieIsPermanentRecentMovieIsFinite(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, store := newTestHandler(t, upstream.URL, 900)
+	h, store := newTestHandler(t, upstream.URL)
 
 	doRequest(t, h, "i=tt-old&apikey=client-key")
 	doRequest(t, h, "i=tt-recent&apikey=client-key")
@@ -439,7 +430,7 @@ func TestConcurrentIdenticalRequestsCollapseToOneUpstreamCall(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -472,7 +463,7 @@ func TestResponseBodyIsByteIdenticalToUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	resp := doRequest(t, h, "i=tt0137523&apikey=client-key")
 	if resp.Body.String() != raw {
@@ -497,7 +488,6 @@ func TestProxyTokenGate(t *testing.T) {
 	h, err := proxy.New(store, proxy.Config{
 		UpstreamURL: upstream.URL,
 		APIKey:      proxyAPIKey,
-		DailyBudget: 900,
 		ProxyToken:  "secret-token",
 	})
 	if err != nil {
@@ -525,7 +515,7 @@ func TestHealthzAndStats(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	healthRec := httptest.NewRecorder()
 	h.Healthz(healthRec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -576,7 +566,6 @@ func TestRequestLoggingNeverLeaksKeys(t *testing.T) {
 	h, err := proxy.New(store, proxy.Config{
 		UpstreamURL: upstream.URL,
 		APIKey:      proxyAPIKey,
-		DailyBudget: 900,
 		ProxyToken:  "secret-token",
 		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
 	})
@@ -603,7 +592,6 @@ func TestRequestLoggingNeverLeaksKeys(t *testing.T) {
 	deadHandler, err := proxy.New(deadStore, proxy.Config{
 		UpstreamURL: dead.URL,
 		APIKey:      proxyAPIKey,
-		DailyBudget: 900,
 		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
 	})
 	if err != nil {
@@ -654,7 +642,7 @@ func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	// Seed a cache entry so the recent-entries table has something
 	// recognisable to assert on.
@@ -675,8 +663,8 @@ func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
 	}
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "900") {
-		t.Errorf("index body does not mention the daily budget (900):\n%s", body)
+	if !strings.Contains(body, "upstream requests served since") {
+		t.Errorf("index body does not report the upstream spend:\n%s", body)
 	}
 	if !strings.Contains(body, "i=tt0137523") {
 		t.Errorf("index body does not mention the seeded cached query:\n%s", body)
@@ -702,7 +690,7 @@ func TestQueryStringRequestStillBehavesAsProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	resp := doRequest(t, h, "i=tt0137523&apikey=client-key")
 	if got := atomic.LoadInt32(&calls); got != 1 {
@@ -737,7 +725,6 @@ func TestIndexIsUngatedByProxyToken(t *testing.T) {
 	h, err := proxy.New(store, proxy.Config{
 		UpstreamURL: upstream.URL,
 		APIKey:      proxyAPIKey,
-		DailyBudget: 900,
 		ProxyToken:  "secret-token",
 	})
 	if err != nil {
@@ -775,7 +762,7 @@ func TestIndexNeverLeaksAPIKeys(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 	doRequest(t, h, "i=tt0137523&apikey="+clientKey)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -809,7 +796,7 @@ func TestIndexGuardPathAndQueryEdges(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	forcedQuery := httptest.NewRequest(http.MethodGet, "/?", nil)
 	forcedRec := httptest.NewRecorder()
@@ -832,155 +819,12 @@ func TestIndexGuardPathAndQueryEdges(t *testing.T) {
 	}
 }
 
-// TestBreakerProbesAndRecoversWithinTheDay is the regression test for a
-// day lost to nothing at all. OMDb documents neither a quota endpoint
-// nor a reset time, and its day plainly does not start at UTC midnight:
-// a miss just after ours would hit a key that upstream still considered
-// spent, arm the breaker, and — when the breaker only cleared at the
-// next UTC midnight — forfeit the following 24 hours even though the
-// key started working again hours earlier.
-//
-// The upstream here reproduces exactly that: exhausted, then fine.
-func TestBreakerProbesAndRecoversWithinTheDay(t *testing.T) {
-	var (
-		calls     int32
-		exhausted atomic.Bool
-	)
-	exhausted.Store(true)
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.Header().Set("Content-Type", "application/json")
-		if exhausted.Load() {
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, quotaJSON)
-			return
-		}
-		fmt.Fprint(w, foundMovieJSON("1999"))
-	}))
-	defer upstream.Close()
-
-	const probeInterval = 15 * time.Minute
-	start := time.Date(2026, 8, 30, 0, 5, 0, 0, time.UTC)
-	clock := &atomic.Pointer[time.Time]{}
-	clock.Store(&start)
-
-	h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
-
-	// The miss just after our midnight lands in OMDb's previous day.
-	if rec := doRequest(t, h, "i=tt0137523&apikey=client-key"); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("first request status = %d, want 401", rec.Code)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("upstream calls = %d, want 1", got)
-	}
-
-	// Everything inside the probe interval is refused locally.
-	within := start.Add(probeInterval - time.Minute)
-	clock.Store(&within)
-	if rec := doRequest(t, h, "i=tt9999999&apikey=client-key"); rec.Code != http.StatusUnauthorized {
-		t.Errorf("in-interval request status = %d, want 401", rec.Code)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (the breaker must absorb misses between probes)", got)
-	}
-
-	// OMDb rolls into its own new day, hours before ours.
-	exhausted.Store(false)
-	after := start.Add(probeInterval)
-	clock.Store(&after)
-
-	rec := doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("probe request status = %d, want 200 once upstream recovered", rec.Code)
-	}
-	if rec.Body.String() != foundMovieJSON("1999") {
-		t.Errorf("probe body = %q, want the movie", rec.Body.String())
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("upstream calls = %d, want 2 (exactly one probe)", got)
-	}
-
-	// The recovered probe restarts the budget: the counter is back to
-	// zero (bar the probe itself) and the breaker is closed, so the
-	// proxy serves the rest of the day instead of idling until UTC
-	// midnight.
-	quota, err := store.Quota(t.Context(), *clock.Load())
-	if err != nil {
-		t.Fatalf("store.Quota: %v", err)
-	}
-	if quota.ExhaustedAt != nil {
-		t.Errorf("ExhaustedAt = %v, want nil after a successful probe", quota.ExhaustedAt)
-	}
-	if quota.Used != 1 {
-		t.Errorf("Used = %d, want 1: a successful probe starts a fresh upstream day and counts itself", quota.Used)
-	}
-
-	// A different query now reaches upstream immediately, with no wait
-	// for another interval.
-	if rec := doRequest(t, h, "i=tt0111161&apikey=client-key"); rec.Code != http.StatusOK {
-		t.Errorf("post-recovery request status = %d, want 200", rec.Code)
-	}
-	if got := atomic.LoadInt32(&calls); got != 3 {
-		t.Errorf("upstream calls = %d, want 3 (traffic resumes normally after recovery)", got)
-	}
-}
-
-// TestFailedProbeRearmsBreaker: a probe that still comes back exhausted
-// must cost exactly one call and buy another full interval of quiet,
-// otherwise every subsequent miss would ride through the open breaker.
-func TestFailedProbeRearmsBreaker(t *testing.T) {
-	var calls int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprint(w, quotaJSON)
-	}))
-	defer upstream.Close()
-
-	const probeInterval = 15 * time.Minute
-	start := time.Date(2026, 8, 30, 3, 0, 0, 0, time.UTC)
-	clock := &atomic.Pointer[time.Time]{}
-	clock.Store(&start)
-
-	h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
-
-	doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("upstream calls = %d, want 1", got)
-	}
-
-	probeTime := start.Add(probeInterval)
-	clock.Store(&probeTime)
-	doRequest(t, h, "i=tt9999999&apikey=client-key")
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("upstream calls = %d, want 2 (one probe)", got)
-	}
-
-	// Immediately afterwards the breaker is armed again.
-	justAfter := probeTime.Add(time.Minute)
-	clock.Store(&justAfter)
-	for i := 0; i < 5; i++ {
-		doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Errorf("upstream calls = %d, want 2 (a failed probe must re-arm the breaker)", got)
-	}
-
-	quota, err := store.Quota(t.Context(), *clock.Load())
-	if err != nil {
-		t.Fatalf("store.Quota: %v", err)
-	}
-	if quota.ExhaustedAt == nil || !quota.ExhaustedAt.Equal(probeTime) {
-		t.Errorf("ExhaustedAt = %v, want %v (the probe re-arms from its own moment)", quota.ExhaustedAt, probeTime)
-	}
-}
-
-// TestStatsDistinguishesUpstreamRefusalFromSpentBudget covers the
-// reporting half of the fix: zero remaining has two causes that want
-// opposite reactions from an operator, and /stats has to say which.
-func TestStatsDistinguishesUpstreamRefusalFromSpentBudget(t *testing.T) {
+// TestStatsReportsUpstreamRefusal covers the reporting half: an
+// operator looking at /stats has to be able to tell "OMDb is refusing
+// this key" from "everything is fine", since the proxy keeps serving
+// cached and stale responses either way and looks identical from
+// outside.
+func TestStatsReportsUpstreamRefusal(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -988,20 +832,21 @@ func TestStatsDistinguishesUpstreamRefusalFromSpentBudget(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, _ := newTestHandler(t, upstream.URL, 900)
+	h, _ := newTestHandler(t, upstream.URL)
 
 	var before map[string]any
 	decodeStats(t, h, &before)
 	if before["quota_exhausted_upstream"] != false {
-		t.Errorf("quota_exhausted_upstream = %v before any upstream refusal, want false", before["quota_exhausted_upstream"])
+		t.Errorf("quota_exhausted_upstream = %v before any refusal, want false", before["quota_exhausted_upstream"])
 	}
-	// The epoch starts with the first request, not at midnight: nothing
-	// has been spent yet, so it is anchored to the test's clock.
-	if before["quota_epoch_started_at"] != "2026-08-30T12:00:00Z" {
-		t.Errorf("quota_epoch_started_at = %v, want the current instant on an unspent ledger", before["quota_epoch_started_at"])
+	if before["quota_counting_since"] != "2026-08-30T12:00:00Z" {
+		t.Errorf("quota_counting_since = %v, want the current instant on an unspent ledger", before["quota_counting_since"])
 	}
-	if before["quota_resets_at"] != "2026-08-31T12:00:00Z" {
-		t.Errorf("quota_resets_at = %v, want one epoch on from the epoch start", before["quota_resets_at"])
+	if _, ok := before["quota_budget"]; ok {
+		t.Error("quota_budget is still reported, want it gone: there is no local budget")
+	}
+	if _, ok := before["quota_remaining"]; ok {
+		t.Error("quota_remaining is still reported, want it gone: there is no local budget")
 	}
 
 	doRequest(t, h, "i=tt0137523&apikey=client-key")
@@ -1011,16 +856,12 @@ func TestStatsDistinguishesUpstreamRefusalFromSpentBudget(t *testing.T) {
 	if after["quota_exhausted_upstream"] != true {
 		t.Errorf("quota_exhausted_upstream = %v after a quota error, want true", after["quota_exhausted_upstream"])
 	}
-	if after["quota_remaining"] != float64(0) {
-		t.Errorf("quota_remaining = %v, want 0 while the breaker is armed", after["quota_remaining"])
+	if after["quota_exhausted_at"] != "2026-08-30T12:00:00Z" {
+		t.Errorf("quota_exhausted_at = %v, want when upstream refused us", after["quota_exhausted_at"])
 	}
-	// The real spend is one request, not the whole budget: the breaker
-	// no longer forges the counter to trip itself.
-	if after["quota_used"] != float64(1) {
-		t.Errorf("quota_used = %v, want 1 (only the probe itself was spent)", after["quota_used"])
-	}
-	if after["quota_next_probe_at"] != "2026-08-30T12:15:00Z" {
-		t.Errorf("quota_next_probe_at = %v, want an interval after the refusal", after["quota_next_probe_at"])
+	// Being refused is not spending.
+	if after["quota_used"] != float64(0) {
+		t.Errorf("quota_used = %v, want 0: a refused request served nothing", after["quota_used"])
 	}
 }
 
@@ -1037,13 +878,12 @@ func decodeStats(t *testing.T, h *proxy.Handler, into any) {
 	}
 }
 
-// TestInconclusiveProbeKeepsBreakerArmed covers the two ways a probe can
-// come back without a transport error and still prove nothing: an HTML
-// error page from something between us and OMDb, and OMDb rejecting the
-// key outright. Neither says a new quota day has begun, and treating
-// either as recovery would resume full-rate traffic into a key that is
-// still refused.
-func TestInconclusiveProbeKeepsBreakerArmed(t *testing.T) {
+// TestUnrecognisedResponseIsNotTreatedAsRecovery covers the ways a
+// request can come back without a transport error and still prove
+// nothing: an HTML error page from something between us and OMDb, and
+// OMDb rejecting the key outright. Neither says a new quota day has
+// begun, so neither may clear the refusal or restart the count.
+func TestUnrecognisedResponseIsNotTreatedAsRecovery(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		status      int
@@ -1075,26 +915,25 @@ func TestInconclusiveProbeKeepsBreakerArmed(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			const probeInterval = 15 * time.Minute
-			start := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+			refusedAt := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
 			clock := &atomic.Pointer[time.Time]{}
-			clock.Store(&start)
+			clock.Store(&refusedAt)
 
-			h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
+			h, store := newTestHandlerWithClock(t, upstream.URL, clock)
 
-			// Arm the breaker with a real quota error.
+			// Record a real refusal first.
 			doRequest(t, h, "i=tt0137523&apikey=client-key")
 			if got := atomic.LoadInt32(&calls); got != 1 {
 				t.Fatalf("upstream calls = %d, want 1", got)
 			}
 
-			// Probe, and get something that is not an OMDb answer.
+			// A later miss gets something that is not an OMDb answer.
 			exhausted.Store(false)
-			probeTime := start.Add(probeInterval)
-			clock.Store(&probeTime)
+			later := refusedAt.Add(15 * time.Minute)
+			clock.Store(&later)
 			doRequest(t, h, "i=tt9999999&apikey=client-key")
 			if got := atomic.LoadInt32(&calls); got != 2 {
-				t.Fatalf("upstream calls = %d, want 2 (the probe itself)", got)
+				t.Fatalf("upstream calls = %d, want 2 (the retry)", got)
 			}
 
 			quota, err := store.Quota(t.Context(), *clock.Load())
@@ -1102,32 +941,25 @@ func TestInconclusiveProbeKeepsBreakerArmed(t *testing.T) {
 				t.Fatalf("store.Quota: %v", err)
 			}
 			if quota.ExhaustedAt == nil {
-				t.Fatal("breaker closed on an inconclusive probe, want it left armed")
+				t.Fatal("the refusal was forgotten, want it still recorded")
 			}
-			if !quota.ExhaustedAt.Equal(probeTime) {
-				t.Errorf("ExhaustedAt = %v, want %v (the probe re-arms from its own moment)", quota.ExhaustedAt, probeTime)
+			if !quota.ExhaustedAt.Equal(refusedAt) {
+				t.Errorf("ExhaustedAt = %v, want %v (unchanged: nothing new was learned)", quota.ExhaustedAt, refusedAt)
 			}
-			if quota.Used == 1 {
-				t.Error("Used = 1, i.e. the counter was reset: an inconclusive probe must not start a fresh budget")
+			if quota.Used != 0 {
+				t.Errorf("Used = %d, want 0: an unrecognised response served nothing and must not restart the count", quota.Used)
 			}
-
-			// And traffic stays blocked rather than resuming at full rate.
-			justAfter := probeTime.Add(time.Minute)
-			clock.Store(&justAfter)
-			for i := 0; i < 3; i++ {
-				doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
-			}
-			if got := atomic.LoadInt32(&calls); got != 2 {
-				t.Errorf("upstream calls = %d, want 2 (breaker must still absorb misses)", got)
+			if !quota.CountingSince.Equal(refusedAt) {
+				t.Errorf("CountingSince = %v, want %v (unmoved)", quota.CountingSince, refusedAt)
 			}
 		})
 	}
 }
 
-// TestProbeRecoversOnAnOrdinaryMiss pins the other side of that bar: a
+// TestOrdinaryMissCountsAsRecovery pins the other side of that bar: a
 // plain "Movie not found!" is a 200 with a real OMDb envelope, which is
 // proof the key was served and therefore proof of a new quota day.
-func TestProbeRecoversOnAnOrdinaryMiss(t *testing.T) {
+func TestOrdinaryMissCountsAsRecovery(t *testing.T) {
 	var (
 		calls     int32
 		exhausted atomic.Bool
@@ -1151,7 +983,7 @@ func TestProbeRecoversOnAnOrdinaryMiss(t *testing.T) {
 	clock := &atomic.Pointer[time.Time]{}
 	clock.Store(&start)
 
-	h, store := newTestHandlerWithClock(t, upstream.URL, 900, clock, probeInterval)
+	h, store := newTestHandlerWithClock(t, upstream.URL, clock)
 
 	doRequest(t, h, "i=tt0137523&apikey=client-key")
 	exhausted.Store(false)
@@ -1171,89 +1003,36 @@ func TestProbeRecoversOnAnOrdinaryMiss(t *testing.T) {
 	}
 }
 
-// TestBudgetSurvivesUTCMidnightAfterRecovery is the end-to-end form of
-// the accounting bug: with the counter keyed by UTC date, an epoch that
-// began at OMDb's own 06:00 rollover would be handed a second full
-// budget at our midnight — inside one upstream quota day — and spend it
-// straight into a real refusal.
-func TestBudgetSurvivesUTCMidnightAfterRecovery(t *testing.T) {
-	var (
-		calls     int32
-		exhausted atomic.Bool
-	)
-	exhausted.Store(true)
-
+// TestIndexRendersUpstreamRefusal exercises the dashboard's other
+// branch. A mistyped field there is invisible until the page is
+// rendered in exactly this state, which is the state an operator is
+// most likely to be looking at it in.
+func TestIndexRendersUpstreamRefusal(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
-		if exhausted.Load() {
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, quotaJSON)
-			return
-		}
-		fmt.Fprint(w, foundMovieJSON("1999"))
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, quotaJSON)
 	}))
 	defer upstream.Close()
 
-	const budget = 3
-	start := time.Date(2026, 8, 30, 0, 5, 0, 0, time.UTC)
-	clock := &atomic.Pointer[time.Time]{}
-	clock.Store(&start)
+	h, _ := newTestHandler(t, upstream.URL)
+	doRequest(t, h, "i=tt0137523&apikey=client-key")
 
-	h, store := newTestHandlerWithClock(t, upstream.URL, budget, clock, 15*time.Minute)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 
-	// A miss just after our midnight lands in OMDb's previous day and
-	// arms the breaker.
-	doRequest(t, h, "i=tt0000001&apikey=client-key")
-
-	// OMDb rolls over at 06:00; the next probe finds it and starts the
-	// epoch there.
-	exhausted.Store(false)
-	rollover := time.Date(2026, 8, 30, 6, 0, 0, 0, time.UTC)
-	clock.Store(&rollover)
-	doRequest(t, h, "i=tt0000002&apikey=client-key")
-
-	quota, err := store.Quota(t.Context(), rollover)
-	if err != nil {
-		t.Fatalf("store.Quota: %v", err)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index status = %d, want 200", rec.Code)
 	}
-	if !quota.EpochStartedAt.Equal(rollover) {
-		t.Fatalf("EpochStartedAt = %v, want the observed rollover %v", quota.EpochStartedAt, rollover)
+	body := rec.Body.String()
+	if !strings.Contains(body, "OMDb is refusing this key") {
+		t.Errorf("index does not report the refusal:\n%s", body)
 	}
-
-	// Spend the rest of the budget during the day.
-	afternoon := rollover.Add(8 * time.Hour)
-	clock.Store(&afternoon)
-	doRequest(t, h, "i=tt0000003&apikey=client-key")
-	doRequest(t, h, "i=tt0000004&apikey=client-key")
-
-	spent := atomic.LoadInt32(&calls)
-	if spent != int32(budget+1) {
-		t.Fatalf("upstream calls = %d, want %d (the doomed first miss plus the budget)", spent, budget+1)
+	if !strings.Contains(body, "2026-08-30 12:00 UTC") {
+		t.Errorf("index does not show when upstream refused us:\n%s", body)
 	}
-
-	// Cross UTC midnight. OMDb's day has not rolled — the next one is
-	// due at 06:00 — so nothing more may be spent.
-	pastMidnight := time.Date(2026, 8, 31, 0, 30, 0, 0, time.UTC)
-	clock.Store(&pastMidnight)
-	for i := 5; i < 9; i++ {
-		rec := doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("post-midnight request status = %d, want 401 (budget still spent)", rec.Code)
-		}
-	}
-	if got := atomic.LoadInt32(&calls); got != spent {
-		t.Errorf("upstream calls = %d, want %d: UTC midnight must not hand out a second budget", got, spent)
-	}
-
-	// One epoch on from the observed rollover, the budget starts over
-	// at that same hour.
-	nextDay := rollover.Add(24 * time.Hour).Add(time.Minute)
-	clock.Store(&nextDay)
-	if rec := doRequest(t, h, "i=tt0000009&apikey=client-key"); rec.Code != http.StatusOK {
-		t.Errorf("next-epoch request status = %d, want 200", rec.Code)
-	}
-	if got := atomic.LoadInt32(&calls); got != spent+1 {
-		t.Errorf("upstream calls = %d, want %d (the new epoch spends again)", got, spent+1)
+	if !strings.Contains(body, "will try upstream again") {
+		t.Errorf("index does not say the next miss retries anyway:\n%s", body)
 	}
 }

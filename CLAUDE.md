@@ -9,7 +9,7 @@ A self-hosted caching proxy in front of `omdbapi.com`, wire-compatible with it. 
 Two facts shape nearly every decision here:
 
 - **The proxy is transparent.** A consumer switches to it by changing only its base URL. Anything that makes a response differ from what OMDb itself would have sent — a custom error shape, a rewritten body, a locally-invented rejection — breaks that contract and is almost always the wrong change. The one deliberate exception is the additive `X-Cache` header.
-- **The cache is the product.** Aggressiveness is the point. A change that shortens a TTL, adds a refetch, or drops an entry needs to justify itself in requests-per-day, because the budget is the scarce resource.
+- **The cache is the product.** Aggressiveness is the point. A change that shortens a TTL, adds a refetch, or drops an entry needs to justify itself in requests-per-day, because OMDb's daily limit is the scarce resource.
 
 ## Commands
 
@@ -28,7 +28,7 @@ curl 'localhost:8090/?i=tt0137523' -i                 # check the X-Cache header
 curl localhost:8090/stats
 ```
 
-`OMDB_API_KEY` is the only required variable; startup fails fast without it. Everything else defaults: `ADDR=:8090`, `DB_PATH=/data/cache.db`, `DAILY_BUDGET=900`, `UPSTREAM_URL=https://www.omdbapi.com`, `NOTFOUND_TTL=168h`, `QUOTA_PROBE_INTERVAL=15m`, `PROXY_TOKEN` unset.
+`OMDB_API_KEY` is the only required variable; startup fails fast without it. Everything else defaults: `ADDR=:8090`, `DB_PATH=/data/cache.db`, `UPSTREAM_URL=https://www.omdbapi.com`, `NOTFOUND_TTL=168h`, `PROXY_TOKEN` unset. There is no local request budget — see the quota invariants below.
 
 There is no `.env` loader in this repo — the process reads the real environment, and `compose.yaml` feeds it via `env_file`.
 
@@ -40,7 +40,7 @@ internal/cache    SQLite store: responses table, quota ledger, stats
 internal/proxy    HTTP handler, canonicalisation, expiry policy, upstream client
 ```
 
-**Request path.** `ServeHTTP` optionally checks `PROXY_TOKEN`, canonicalises the query, and tries a fast-path cache read. A fresh hit returns immediately. Otherwise the request enters `singleflight.Group.Do` keyed by the cache key, and `resolve` re-checks the cache (another goroutine may have just filled it), reserves quota, fetches upstream, decides an expiry, and stores the result.
+**Request path.** `ServeHTTP` optionally checks `PROXY_TOKEN`, canonicalises the query, and tries a fast-path cache read. A fresh hit returns immediately. Otherwise the request enters `singleflight.Group.Do` keyed by the cache key, and `resolve` re-checks the cache (another goroutine may have just filled it), fetches upstream, records what upstream said about the quota, decides an expiry, and stores the result.
 
 A store error on the *fast path* is deliberately non-fatal — it falls through to `resolve`, which re-reads the cache and will surface a persistent error there.
 
@@ -58,27 +58,21 @@ These are the expensive ones. Each corresponds to a test; if a test here looks w
 
 **Never cache a quota error.** It is a fact about the proxy's key today, not about the movie. Caching one poisons the entry — permanently, if the expiry policy happened to classify it as an old film.
 
-**A quota error arms a circuit breaker that probes rather than latches.** `resolve` calls `store.MarkExhausted` before falling back, which records *when* upstream refused us. `TryReserveQuota` then refuses every caller until `QUOTA_PROBE_INTERVAL` (default 15m) has passed, at which point exactly one caller is granted a probe — the grant pushes `exhausted_at` forward to now, so a burst of misses cannot become a burst of doomed calls. A probe that comes back normal calls `MarkRecovered`; a probe that comes back exhausted re-arms.
+**Every cache miss tries upstream. There is no local budget and no minimum gap between attempts.** This is the whole quota design, and it is deliberately smaller than what it replaced. `resolve` goes straight to `fetchUpstream`; a decoded quota error calls `store.MarkExhausted`, and any response that is recognisably OMDb answering calls `store.RecordServed`.
 
-**"Normal" for a probe means HTTP 200 *and* a recognisable OMDb envelope**, not merely the absence of a quota error. `recognisedEnvelope` exists for this and is deliberately stricter than `parseEnvelope`, which degrades to a substring scan so it never misses a quota error. Recovery hands the proxy a whole fresh budget, so the bar is proof OMDb served us: a 502 HTML page from a CDN and an `Invalid API key!` both lack a quota error while saying nothing about the quota day, and either would resume full-rate traffic into a key that is still refused. An ordinary `Movie not found!` does qualify — it is a served answer.
+**A run of misses against an exhausted key makes a run of doomed upstream calls, on purpose.** Do not "fix" this by adding a retry interval, a circuit breaker, or a local cap — all three have been tried here and each one cost a real outage. OMDb publishes no way to read remaining quota and documents no reset time ([issue #335](https://github.com/omdbapi/OMDb-API/issues/335) asks and never got an answer), so a request it actually answers is the *only* evidence its day has rolled over. Refusing to make that request is refusing to ever find out: an earlier breaker latched until UTC midnight and idled a live deployment for a full day while its key worked again within hours. The doomed calls cost latency, not quota — upstream is already refusing them.
 
-The local `DAILY_BUDGET` counter is only a *prediction* of OMDb's counter, and the two drift whenever the cache DB is recreated, the budget is raised, or the key is used elsewhere. An upstream quota error is ground truth that the prediction was wrong. This matters most alongside stale serving: when a stale entry exists the consumer receives `STALE` and carries on requesting, so it never sees the quota signal that would make it stop — without the breaker, the proxy would spend the whole run on doomed upstream calls.
+**A served response after a refusal means OMDb's day rolled over.** `RecordServed` carries that rule in one statement: if `exhausted_at` was set, `used` restarts at 1 and `counting_since` moves to now; otherwise `used` increments. This assumes the proxy is the sole spender of its key — if something else shares it, the restart is optimistic and the next miss simply rediscovers exhaustion.
 
-**A recovered probe starts a new accounting epoch, because it is the only observable start of an upstream quota day.** OMDb publishes no way to read remaining quota and does not document when its day rolls over — [issue #335](https://github.com/omdbapi/OMDb-API/issues/335) asks and never got an answer — and its boundary is demonstrably *not* UTC midnight. So the ledger is a single `quota_epoch` row (`used`, `epoch_started_at`, `exhausted_at`), not a table keyed by UTC date. `MarkRecovered` anchors `epoch_started_at` to the moment a refused key answered again and restarts `used` at 1 (the probe itself was served out of the new upstream day, and over-counting is the safe direction against a limit we cannot read).
+**"Served" means HTTP 200 *and* a recognisable OMDb envelope**, not merely the absence of a quota error. `recognisedEnvelope` exists for this and is deliberately stricter than `parseEnvelope`, which degrades to a substring scan so it never misses a quota error. A 502 HTML page from a CDN and an `Invalid API key!` both lack a quota error while saying nothing about the quota day. An ordinary `Movie not found!` does qualify — it is a served answer.
 
-Two failures came from keying this to the calendar, and both are covered by tests. Latching the breaker until the next UTC midnight cost a live deployment a full day: the first miss after UTC midnight hit a key OMDb still considered spent, latched the breaker, and forfeited the following 24 hours while the key worked again within a few. Resetting a UTC-date-keyed counter at midnight was the mirror image: an epoch anchored to OMDb's 06:00 rollover would be handed a *second* full budget at our midnight, inside one upstream day, and spend it into a real refusal. `TestUTCMidnightDoesNotResetTheCounter` and `TestBudgetSurvivesUTCMidnightAfterRecovery` pin that.
+**`MarkExhausted` must never touch `used`.** An older design tripped a breaker by forging the counter up to the budget, which left a period the proxy never got to use byte-identical to one it spent, so neither `/stats` nor the dashboard could answer "did we spend it, or did OMDb cut us off?". `used` is a real measurement; `exhausted_at` only ever moves forward (`MAX`), so a stale caller cannot rewrite when upstream refused us.
 
-Absent an observed rollover the epoch rolls itself one `QuotaEpochLength` (24h) on, in whole steps rather than jumping to now — the step preserves the hour, so once a probe pins the epoch to OMDb's actual rollover, every later epoch rolls at that hour without rediscovering it by hitting the wall. An epoch rollover deliberately leaves `exhausted_at` armed: the rollover is the proxy's own estimate, the breaker is something upstream actually said, and only a probe may overrule it.
+**The operator-facing surfaces must say which of the two states the proxy is in.** `quota_exhausted_upstream` in `/stats` and the dashboard's two notes exist because "serving normally" and "OMDb is refusing this key" look identical from outside — the proxy keeps answering from cache either way. The `Warn` log line in `resolve` is the only other place a refusal is observable.
 
-This all assumes the proxy is the sole spender of its key; if something else shares it, the new epoch is optimistic and the next probe simply rediscovers exhaustion.
+**Quota exhaustion reaches the consumer as OMDb's own bytes.** On a miss with no stale entry, an exhausted key produces upstream's actual `{"Response":"False","Error":"Request limit reached!"}` with its actual HTTP 401, passed through verbatim like every other body. Consumers already recognise this and abort their enrichment pass cleanly. Never synthesise it locally and never replace it with a proxy-specific error — the proxy no longer has a reason to invent one, since it always asks upstream first.
 
-**`MarkExhausted` must never touch `used`.** Tripping the breaker by forging the counter (the old `used = MAX(used, excluded.used)` upsert) left a forfeited day byte-identical to a legitimately spent one, so neither `/stats` nor the dashboard could answer "did we spend it, or did OMDb cut us off?". `used` is now a real measurement and the breaker is a separate column; `exhausted_at` only ever moves forward (`MAX`), so a stale caller cannot wind it back and hand out an early probe.
-
-**Zero remaining has two causes and the operator-facing surfaces must distinguish them.** `quota_exhausted_upstream` in `/stats` and the dashboard's two different notes exist because "we spent our own 900" and "OMDb refused the key" look identical from outside and want opposite reactions. The `Warn` log line in `resolve` is the only other place an armed breaker is observable.
-
-**Quota exhaustion is signalled with OMDb's own body.** On a miss with no stale entry and no budget, the proxy returns `{"Response":"False","Error":"Request limit reached!"}` with HTTP 401, byte-identical to upstream. Consumers already recognise this and abort their enrichment pass cleanly. Do not replace it with a proxy-specific error.
-
-**Serve stale rather than fail.** An expired entry plus a failing upstream, an exhausted budget, or an upstream quota error all return the stale body with `X-Cache: STALE`. A consumer should never break because the proxy ran out of quota. A true miss with nothing stale and a dead upstream is the only case that errors.
+**Serve stale rather than fail.** An expired entry plus either a failing upstream or an upstream quota error returns the stale body with `X-Cache: STALE`. A consumer should never break because the proxy ran out of quota. A true miss with nothing stale and a dead upstream is the only case that errors.
 
 **Quota detection matches `request limit` case-insensitively on a substring.** OMDb owns the exact wording. Pinning the literal string would silently stop detecting exhaustion and start caching it as a real miss.
 
@@ -129,7 +123,7 @@ Quota, breaker, and singleflight tests assert exact upstream call counts via an 
 
 ## Docker
 
-Multi-stage, `CGO_ENABLED=0` (the driver is pure-Go `modernc.org/sqlite`), final stage `gcr.io/distroless/static-debian12`. A separate `alpine` stage exists solely to supply `ca-certificates.crt`: `golang:alpine` does not install it and `distroless/static` ships none, so without that copy every upstream fetch dies at the TLS handshake with `x509: certificate signed by unknown authority`. The cache lives on the `/data` volume; losing it means refilling at `DAILY_BUDGET` per day.
+Multi-stage, `CGO_ENABLED=0` (the driver is pure-Go `modernc.org/sqlite`), final stage `gcr.io/distroless/static-debian12`. A separate `alpine` stage exists solely to supply `ca-certificates.crt`: `golang:alpine` does not install it and `distroless/static` ships none, so without that copy every upstream fetch dies at the TLS handshake with `x509: certificate signed by unknown authority`. The cache lives on the `/data` volume; losing it means refilling it against OMDb's own daily limit.
 
 CI publishes multi-arch images to `ghcr.io/lepinkainen/omdb-proxy`; `compose.prod.yaml` runs one on the VPS, `compose.yaml` builds locally. `ai-docs/deployment.md` carries the reasoning behind the cross-compile pin, the bind mount, and the non-root user — read it before changing any of those.
 

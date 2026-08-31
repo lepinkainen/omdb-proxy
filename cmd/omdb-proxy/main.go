@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -47,13 +46,11 @@ func run(logger *slog.Logger) error {
 	defer store.Close()
 
 	handler, err := proxy.New(store, proxy.Config{
-		UpstreamURL:        cfg.upstreamURL,
-		APIKey:             cfg.apiKey,
-		DailyBudget:        cfg.dailyBudget,
-		ProxyToken:         cfg.proxyToken,
-		NotFoundTTL:        cfg.notFoundTTL,
-		QuotaProbeInterval: cfg.probeInterval,
-		Logger:             logger,
+		UpstreamURL: cfg.upstreamURL,
+		APIKey:      cfg.apiKey,
+		ProxyToken:  cfg.proxyToken,
+		NotFoundTTL: cfg.notFoundTTL,
+		Logger:      logger,
 	})
 	if err != nil {
 		return errors.Wrap(err, "construct proxy handler")
@@ -75,7 +72,7 @@ func run(logger *slog.Logger) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("omdb-proxy listening", "addr", cfg.addr, "daily_budget", cfg.dailyBudget, "db_path", cfg.dbPath)
+		logger.Info("omdb-proxy listening", "addr", cfg.addr, "db_path", cfg.dbPath)
 		serveErr <- server.ListenAndServe()
 	}()
 
@@ -101,13 +98,9 @@ type config struct {
 	apiKey      string
 	addr        string
 	dbPath      string
-	dailyBudget int
 	upstreamURL string
 	proxyToken  string
 	notFoundTTL time.Duration
-	// probeInterval is how long the upstream circuit breaker waits
-	// between probes; see proxy.DefaultQuotaProbeInterval.
-	probeInterval time.Duration
 }
 
 // loadConfig reads environment variables, applying defaults. OMDB_API_KEY
@@ -121,30 +114,18 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("OMDB_API_KEY is required")
 	}
 
-	budget, err := envInt("DAILY_BUDGET", 900)
-	if err != nil {
-		return config{}, err
-	}
-
 	notFoundTTL, err := envDuration("NOTFOUND_TTL", proxy.DefaultNotFoundTTL)
 	if err != nil {
 		return config{}, err
 	}
 
-	probeInterval, err := envDuration("QUOTA_PROBE_INTERVAL", proxy.DefaultQuotaProbeInterval)
-	if err != nil {
-		return config{}, err
-	}
-
 	return config{
-		apiKey:        apiKey,
-		addr:          envOr("ADDR", ":8090"),
-		dbPath:        envOr("DB_PATH", "/data/cache.db"),
-		dailyBudget:   budget,
-		upstreamURL:   envOr("UPSTREAM_URL", "https://www.omdbapi.com"),
-		proxyToken:    os.Getenv("PROXY_TOKEN"),
-		notFoundTTL:   notFoundTTL,
-		probeInterval: probeInterval,
+		apiKey:      apiKey,
+		addr:        envOr("ADDR", ":8090"),
+		dbPath:      envOr("DB_PATH", "/data/cache.db"),
+		upstreamURL: envOr("UPSTREAM_URL", "https://www.omdbapi.com"),
+		proxyToken:  os.Getenv("PROXY_TOKEN"),
+		notFoundTTL: notFoundTTL,
 	}, nil
 }
 
@@ -153,18 +134,6 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func envInt(key string, fallback int) (int, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, errors.Wrap(err, fmt.Sprintf("parse %s as an integer", key))
-	}
-	return n, nil
 }
 
 func envDuration(key string, fallback time.Duration) (time.Duration, error) {

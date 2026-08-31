@@ -20,7 +20,7 @@ Upgrades are `docker compose -f compose.prod.yaml pull` then `up -d`.
 Production mounts `./data:/data`, so the cache DB sits at
 `~/docker/omdb-proxy/data/cache.db`.
 
-The cache is the product — a fresh one refills at `DAILY_BUDGET` requests per
+The cache is the product — a fresh one refills at OMDb's own daily limit per
 day, so it must survive upgrades, and it is worth being able to inspect. A host
 path can be opened with `sqlite3 data/cache.db` and is picked up by whatever
 backs up `~/docker`. A named volume needs a helper container for both:
