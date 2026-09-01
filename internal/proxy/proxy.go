@@ -214,14 +214,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeBody(w, res.status, res.contentType, res.body, res.cacheStatus)
 }
 
-// logRequest emits the one-per-request line. cacheStatus is the same
-// value the response carries in X-Cache, which makes "did this cost me
-// an upstream call?" readable straight from the log: MISS did, HIT and
+// logRequest emits the one-per-request line. cache is the same value
+// the response carries in X-Cache, which makes "did this cost me an
+// upstream call?" readable straight from the log: MISS did, HIT and
 // STALE did not.
-func (h *Handler) logRequest(canonical, cacheStatus string, status int, start time.Time) {
+func (h *Handler) logRequest(canonical, cache string, status int, start time.Time) {
 	h.logger.Info("request",
 		"query", canonical,
-		"cache", cacheStatus,
+		"cache", cache,
 		"status", status,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
@@ -363,7 +363,7 @@ func (h *Handler) fetchUpstream(ctx context.Context, canonical string) (body []b
 	}
 	values.Set("apikey", h.apiKey)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.upstreamURL+"/?"+values.Encode(), http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.upstreamURL+"/?"+values.Encode(), nil)
 	if err != nil {
 		return nil, "", 0, errors.Wrap(err, "build upstream request")
 	}
@@ -372,7 +372,7 @@ func (h *Handler) fetchUpstream(ctx context.Context, canonical string) (body []b
 	if err != nil {
 		return nil, "", 0, errors.Wrap(withoutURL(err), "upstream request failed")
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {

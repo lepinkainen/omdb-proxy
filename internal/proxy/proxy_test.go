@@ -93,9 +93,9 @@ const notFoundJSON = `{"Response":"False","Error":"Movie not found!"}`
 const quotaJSON = `{"Response":"False","Error":"Request limit reached!"}`
 
 func TestCacheMissThenHit(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, foundMovieJSON("1999"))
 	}))
@@ -119,15 +119,15 @@ func TestCacheMissThenHit(t *testing.T) {
 		t.Errorf("second body = %q, want identical to first %q", second.Body.String(), first.Body.String())
 	}
 
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want 1 (second request should be served from cache)", got)
 	}
 }
 
 func TestCanonicalizationSharesCacheEntry(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, foundMovieJSON("1999"))
 	}))
@@ -138,7 +138,7 @@ func TestCanonicalizationSharesCacheEntry(t *testing.T) {
 	doRequest(t, h, "i=TT0137523&apikey=a")
 	doRequest(t, h, "apikey=b&i=tt0137523")
 
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want 1 (both queries should canonicalise to the same cache entry)", got)
 	}
 }
@@ -161,9 +161,9 @@ func TestClientAPIKeyNeverForwardedUpstream(t *testing.T) {
 }
 
 func TestQuotaResponseIsNotCached(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := calls.Add(1)
+		n := atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		if n == 1 {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -214,7 +214,7 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 	if second.Body.String() != foundMovieJSON("1999") {
 		t.Errorf("second request body = %q, want the movie", second.Body.String())
 	}
-	if got := calls.Load(); got != 2 {
+	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("upstream calls = %d, want 2 (the retry is what discovers the reset)", got)
 	}
 
@@ -251,9 +251,9 @@ func TestQuotaResponseIsNotCached(t *testing.T) {
 // find out. The doomed calls in between are the accepted price: upstream
 // is already refusing, so they cost latency, not quota.
 func TestEveryMissRetriesWhileUpstreamRefuses(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprint(w, quotaJSON)
@@ -263,7 +263,7 @@ func TestEveryMissRetriesWhileUpstreamRefuses(t *testing.T) {
 	h, _ := newTestHandler(t, upstream.URL)
 
 	const misses = 5
-	for i := range misses {
+	for i := 0; i < misses; i++ {
 		rec := doRequest(t, h, fmt.Sprintf("i=tt000000%d&apikey=client-key", i))
 		if rec.Code != http.StatusUnauthorized {
 			t.Errorf("request %d status = %d, want 401", i, rec.Code)
@@ -273,7 +273,7 @@ func TestEveryMissRetriesWhileUpstreamRefuses(t *testing.T) {
 		}
 	}
 
-	if got := calls.Load(); got != misses {
+	if got := atomic.LoadInt32(&calls); got != misses {
 		t.Errorf("upstream calls = %d, want %d (one per cache miss)", got, misses)
 	}
 }
@@ -284,9 +284,9 @@ func TestEveryMissRetriesWhileUpstreamRefuses(t *testing.T) {
 // serving stale — a consumer must never break because the proxy's key
 // is spent.
 func TestQuotaErrorServesStaleForOtherQuery(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprint(w, quotaJSON)
@@ -328,15 +328,15 @@ func TestQuotaErrorServesStaleForOtherQuery(t *testing.T) {
 	// The second request did try upstream — every miss does — and was
 	// refused again; what matters is that the consumer got the stale
 	// body rather than an error, and never saw the quota response.
-	if got := calls.Load(); got != 2 {
+	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("upstream calls = %d, want 2 (each miss tries; the stale body is what the consumer sees)", got)
 	}
 }
 
 func TestNotFoundMissIsCached(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, notFoundJSON)
 	}))
@@ -353,7 +353,7 @@ func TestNotFoundMissIsCached(t *testing.T) {
 	if got := second.Header().Get("X-Cache"); got != "HIT" {
 		t.Errorf("second request X-Cache = %q, want HIT (not-found misses must be cached)", got)
 	}
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want 1", got)
 	}
 }
@@ -430,10 +430,10 @@ func TestExpiryPolicyOldMovieIsPermanentRecentMovieIsFinite(t *testing.T) {
 }
 
 func TestConcurrentIdenticalRequestsCollapseToOneUpstreamCall(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		<-release // hold every concurrent caller open until we say go
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, foundMovieJSON("1999"))
@@ -445,7 +445,7 @@ func TestConcurrentIdenticalRequestsCollapseToOneUpstreamCall(t *testing.T) {
 	const n = 20
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for range n {
+	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
 			doRequest(t, h, "i=tt0137523&apikey=client-key")
@@ -458,7 +458,7 @@ func TestConcurrentIdenticalRequestsCollapseToOneUpstreamCall(t *testing.T) {
 	close(release)
 	wg.Wait()
 
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want exactly 1 for %d concurrent identical requests", got, n)
 	}
 }
@@ -644,9 +644,9 @@ func TestRequestLoggingNeverLeaksKeys(t *testing.T) {
 // cache/quota store, never by treating "" as a canonical query and
 // asking upstream about it.
 func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, foundMovieJSON("1999"))
 	}))
@@ -657,7 +657,7 @@ func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
 	// Seed a cache entry so the recent-entries table has something
 	// recognisable to assert on.
 	doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("setup: upstream calls = %d, want 1", got)
 	}
 
@@ -682,7 +682,7 @@ func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
 
 	// The critical assertion: rendering the index must not have made a
 	// second upstream call.
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want 1 (bare GET / must never reach upstream)", got)
 	}
 }
@@ -692,9 +692,9 @@ func TestBareRootServesIndexWithoutTouchingUpstream(t *testing.T) {
 // request, even one that happens to target the same path, keeps the
 // existing MISS/upstream-call/byte-identical behaviour.
 func TestQueryStringRequestStillBehavesAsProxy(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, foundMovieJSON("1999"))
 	}))
@@ -703,7 +703,7 @@ func TestQueryStringRequestStillBehavesAsProxy(t *testing.T) {
 	h, _ := newTestHandler(t, upstream.URL)
 
 	resp := doRequest(t, h, "i=tt0137523&apikey=client-key")
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want 1", got)
 	}
 	if got := resp.Header().Get("X-Cache"); got != "MISS" {
@@ -798,9 +798,9 @@ func TestIndexNeverLeaksAPIKeys(t *testing.T) {
 // clients that build a base URL with a trailing path segment must keep
 // being proxied.
 func TestIndexGuardPathAndQueryEdges(t *testing.T) {
-	var calls atomic.Int32
+	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, foundMovieJSON("1999"))
 	}))
@@ -814,7 +814,7 @@ func TestIndexGuardPathAndQueryEdges(t *testing.T) {
 	if ct := forcedRec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf(`GET "/?" Content-Type = %q, want a text/html prefix (empty RawQuery is still the index)`, ct)
 	}
-	if got := calls.Load(); got != 0 {
+	if got := atomic.LoadInt32(&calls); got != 0 {
 		t.Errorf(`GET "/?" made %d upstream calls, want 0`, got)
 	}
 
@@ -824,7 +824,7 @@ func TestIndexGuardPathAndQueryEdges(t *testing.T) {
 	if got := nestedRec.Header().Get("X-Cache"); got != "MISS" {
 		t.Errorf("non-root path X-Cache = %q, want MISS (must be proxied, not diverted to the index)", got)
 	}
-	if got := calls.Load(); got != 1 {
+	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("non-root path made %d upstream calls in total, want 1", got)
 	}
 }
@@ -906,13 +906,13 @@ func TestUnrecognisedResponseIsNotTreatedAsRecovery(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				calls     atomic.Int32
+				calls     int32
 				exhausted atomic.Bool
 			)
 			exhausted.Store(true)
 
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
+				atomic.AddInt32(&calls, 1)
 				if exhausted.Load() {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusUnauthorized)
@@ -933,7 +933,7 @@ func TestUnrecognisedResponseIsNotTreatedAsRecovery(t *testing.T) {
 
 			// Record a real refusal first.
 			doRequest(t, h, "i=tt0137523&apikey=client-key")
-			if got := calls.Load(); got != 1 {
+			if got := atomic.LoadInt32(&calls); got != 1 {
 				t.Fatalf("upstream calls = %d, want 1", got)
 			}
 
@@ -942,7 +942,7 @@ func TestUnrecognisedResponseIsNotTreatedAsRecovery(t *testing.T) {
 			later := refusedAt.Add(15 * time.Minute)
 			clock.Store(&later)
 			doRequest(t, h, "i=tt9999999&apikey=client-key")
-			if got := calls.Load(); got != 2 {
+			if got := atomic.LoadInt32(&calls); got != 2 {
 				t.Fatalf("upstream calls = %d, want 2 (the retry)", got)
 			}
 
@@ -971,13 +971,13 @@ func TestUnrecognisedResponseIsNotTreatedAsRecovery(t *testing.T) {
 // proof the key was served and therefore proof of a new quota day.
 func TestOrdinaryMissCountsAsRecovery(t *testing.T) {
 	var (
-		calls     atomic.Int32
+		calls     int32
 		exhausted atomic.Bool
 	)
 	exhausted.Store(true)
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		if exhausted.Load() {
 			w.WriteHeader(http.StatusUnauthorized)

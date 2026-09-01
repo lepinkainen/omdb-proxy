@@ -107,7 +107,7 @@ func parseEnvelope(body []byte, contentType string) (found bool, quotaError bool
 func recognisedEnvelope(body []byte, contentType string) bool {
 	if strings.Contains(strings.ToLower(contentType), "xml") {
 		m := xmlResponseAttr.FindSubmatch(body)
-		return len(m) > 1 && (strings.EqualFold(string(m[1]), "true") || strings.EqualFold(string(m[1]), "false"))
+		return m != nil && (strings.EqualFold(string(m[1]), "true") || strings.EqualFold(string(m[1]), "false"))
 	}
 
 	var env omdbEnvelope
