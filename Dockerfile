@@ -20,7 +20,7 @@ ARG TARGETARCH
 # image has no C toolchain to link against anyway. It is also what makes the
 # cross-compile a plain environment-variable change.
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -o /out/omdb-proxy ./cmd/omdb-proxy
+    go build -ldflags="-w -s" -o /out/omdb-proxy ./cmd/omdb-proxy
 
 # --- certs -----------------------------------------------------------------
 # The golang:alpine build image doesn't install ca-certificates by
