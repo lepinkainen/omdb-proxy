@@ -1,0 +1,79 @@
+version: '3'
+
+vars:
+  BUILD_DIR: build
+
+tasks:
+  build:
+    desc: Build the project (tests and lints first)
+    deps: [test, lint]
+    cmds:
+      - task: build-go
+
+  build-ci:
+    desc: Build only; CI runs test and lint as separate jobs
+    cmds:
+      - task: build-go
+
+  build-go:
+    desc: Build the omdb-proxy binary
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -o {{.BUILD_DIR}}/omdb-proxy ./cmd/omdb-proxy
+
+  test:
+    desc: Run tests
+    cmds:
+      - task: test-go
+
+  test-go:
+    desc: Run Go tests (-race is required — the singleflight and quota tests depend on it)
+    cmds:
+      - go test ./... -race
+
+  test-ci:
+    desc: Run Go tests with coverage for CI
+    cmds:
+      - go test ./... -race -cover
+
+  lint:
+    desc: Lint code
+    cmds:
+      - task: lint-go
+
+  lint-go:
+    desc: Lint Go code
+    cmds:
+      - go fix ./...
+      - goimports -w .
+      - golangci-lint run
+      - go vet ./...
+      - go mod tidy
+
+  # Advisory Go tooling (not part of `lint`, so it never blocks a build)
+
+  vuln-go:
+    desc: Scan dependencies for known vulnerabilities (advisory)
+    cmds:
+      - govulncheck ./... # requires golang.org/x/vuln/cmd/govulncheck
+
+  deadcode-go:
+    desc: Report unreachable Go functions (advisory; interface-only test methods are expected false positives)
+    cmds:
+      - deadcode -test ./... # requires golang.org/x/tools/cmd/deadcode
+
+  cognit-go:
+    desc: Report Go functions with cognitive complexity > 20 with per-branch diagnostics (advisory; tests ignored)
+    cmds:
+      - |
+        gocognit -ignore "_test" -over 20 -d -json . | jq -r '.[] | "\(.Complexity) \(.PkgName) \(.FuncName) \(.Pos.Filename):\(.Pos.Line):\(.Pos.Column)\n" + ([.Diagnostics[] | "  +\(.Inc) (nest \(.Nesting // 0)) \(.Text) @ \(.Pos.Line):\(.Pos.Column)"] | join("\n"))' # requires github.com/uudashr/gocognit + jq
+
+  dev:
+    desc: Run the proxy locally
+    cmds:
+      - go run ./cmd/omdb-proxy
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf {{.BUILD_DIR}}

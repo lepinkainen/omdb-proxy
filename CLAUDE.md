@@ -13,12 +13,14 @@ Two facts shape nearly every decision here:
 
 ## Commands
 
+`task build` / `task test` / `task lint` (see `Taskfile.yml`) are the entry points; CI calls the same tasks. What they run underneath:
+
 ```bash
-go build ./...
-go vet ./...
-go test ./...
-go test ./... -race                                   # singleflight and quota tests need this
-gofmt -l .                                            # must print nothing
+go build -o build/omdb-proxy ./cmd/omdb-proxy
+go test ./... -race                                   # -race is required: singleflight and quota tests depend on it
+go test ./... -race -cover                            # task test-ci
+go fix ./... && goimports -w . && golangci-lint run && go vet ./... && go mod tidy   # task lint
+
 go test ./internal/proxy/ -run TestQuotaResponseIsNotCached -v   # single test
 
 OMDB_API_KEY=xxx DB_PATH=/tmp/scratch.db ADDR=:8090 go run ./cmd/omdb-proxy

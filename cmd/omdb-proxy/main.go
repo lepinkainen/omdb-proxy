@@ -43,7 +43,11 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.Wrap(err, "open cache database")
 	}
-	defer store.Close()
+	defer func() {
+		if cerr := store.Close(); cerr != nil {
+			logger.Error("close cache database", "error", cerr.Error())
+		}
+	}()
 
 	handler, err := proxy.New(store, proxy.Config{
 		UpstreamURL: cfg.upstreamURL,

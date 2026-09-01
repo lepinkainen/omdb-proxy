@@ -1,0 +1,59 @@
+version: "2"
+
+run:
+  timeout: 5m
+  issues-exit-code: 1
+  tests: false # No point in linting tests
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - gocritic
+    - revive
+    - errorlint     # catches err == ErrFoo style comparisons (use errors.Is)
+    - bodyclose     # missing res.Body.Close() on HTTP responses
+    - contextcheck  # context.Context propagation
+    - sqlclosecheck # *sql.Rows / *sql.Stmt close checks
+    - noctx         # HTTP requests without context
+    - gosec         # common security smells
+    - unparam       # always-nil error returns, unused params
+    - gocyclo       # cyclomatic complexity guard
+  settings:
+    govet:
+      enable:
+        - shadow
+        - nilness # tautological nil checks, nil-pointer derefs; gopls flags these but plain govet does not
+    gocyclo:
+      min-complexity: 15 # raise if existing codebase has many large funcs
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - exitAfterDefer # CLI apps often exit after defer
+        - rangeValCopy # Sometimes acceptable for readability
+        - hugeParam # Not performance critical application
+        - singleCaseSwitch # Sometimes switch is more readable than if
+        - ifElseChain # Sometimes if-else is clearer than switch
+        - paramTypeCombine # Sometimes separate params are clearer
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+          severity: warning
+          disabled: false
+          arguments:
+            - "checkPrivateReceivers"
+            - "sayRepetitiveInsteadOfStutters"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
