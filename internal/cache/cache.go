@@ -100,20 +100,22 @@ func Open(path string) (*Store, error) {
 	// deliberate rather than an oversight.
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
-		db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = WAL;`); err != nil {
+		_ = db.Close()
 		return nil, errors.Wrap(err, "enable WAL mode")
 	}
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
-		db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000;`); err != nil {
+		_ = db.Close()
 		return nil, errors.Wrap(err, "set busy timeout")
 	}
-	if err := dropLegacyQuotaTable(db); err != nil {
-		db.Close()
+	if err := dropLegacyQuotaTable(ctx, db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		_ = db.Close()
 		return nil, errors.Wrap(err, "create schema")
 	}
 
@@ -130,8 +132,8 @@ func Open(path string) (*Store, error) {
 // value (the old exhaustion marker pushed it up to the budget to stop
 // itself). Starting the counter fresh costs nothing — it is a reporting
 // number now, not a limit.
-func dropLegacyQuotaTable(db *sql.DB) error {
-	if _, err := db.Exec(`DROP TABLE IF EXISTS quota`); err != nil {
+func dropLegacyQuotaTable(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS quota`); err != nil {
 		return errors.Wrap(err, "drop legacy quota table")
 	}
 	return nil
@@ -417,7 +419,7 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Summary, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "query recent entries")
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []Summary
 	for rows.Next() {
