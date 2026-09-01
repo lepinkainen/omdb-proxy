@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/cockroachdb/errors"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -147,7 +148,7 @@ func TestRecordServedCountsUpstreamRequests(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := store.RecordServed(ctx, quotaTestClock); err != nil {
 			t.Fatalf("RecordServed: %v", err)
 		}
@@ -176,7 +177,7 @@ func TestRecordServedAfterExhaustionRestartsTheCount(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err := store.RecordServed(ctx, quotaTestClock); err != nil {
 			t.Fatalf("RecordServed: %v", err)
 		}
@@ -242,7 +243,7 @@ func TestLateSuccessFromBeforeARefusalIsNotRecovery(t *testing.T) {
 	ctx := context.Background()
 
 	issuedEarly := quotaTestClock
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if err := store.RecordServed(ctx, issuedEarly); err != nil {
 			t.Fatalf("RecordServed: %v", err)
 		}
@@ -459,7 +460,7 @@ func TestRecentOrdersNewestFirstAndRespectsLimit(t *testing.T) {
 	ctx := context.Background()
 
 	base := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		e := Entry{
 			CacheKey:    fmt.Sprintf("key-%d", i),
 			Query:       fmt.Sprintf("i=tt%d", i),
